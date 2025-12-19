@@ -19,32 +19,47 @@ export async function connectToDatabase() {
     }
 }
 
-export async function saveWalletConnection(chatId, walletAddress, username, sessionId, phantomEncryptionPubKey) {
+export async function saveWallet(chatId, publicKey, encryptedPrivateKey, username) {
     try {
-        const collection = db.collection('wallet_connections');
-        const connectionData = {
+        const collection = db.collection('wallets');
+        const walletData = {
             chatId: String(chatId),
-            walletAddress,
+            publicKey,
+            encryptedPrivateKey,
             username,
-            sessionId,
-            phantomEncryptionPubKey,
-            connectedAt: new Date(),
+            createdAt: new Date(),
             lastActivity: new Date()
         };
 
         // Upsert - update if exists, insert if not
         await collection.updateOne(
             { chatId: String(chatId) },
-            { $set: connectionData },
+            { $set: walletData },
             { upsert: true }
         );
 
-        console.log(`✅ Wallet connection saved for chat ${chatId}`);
+        console.log(`✅ Wallet saved for chat ${chatId}`);
         return true;
     } catch (error) {
-        console.error('❌ Failed to save wallet connection:', error);
+        console.error('❌ Failed to save wallet:', error);
         return false;
     }
+}
+
+export async function getWallet(chatId) {
+    try {
+        const collection = db.collection('wallets');
+        const wallet = await collection.findOne({ chatId: String(chatId) });
+        return wallet;
+    } catch (error) {
+        console.error('❌ Failed to get wallet:', error);
+        return null;
+    }
+}
+
+// Legacy function for backward compatibility (deprecated)
+export async function saveWalletConnection(chatId, walletAddress, username, sessionId, phantomEncryptionPubKey) {
+    return saveWallet(chatId, walletAddress, null, username);
 }
 
 export async function saveRouteHistory(chatId, inputMint, outputMint, amount, routeDetails, username) {
@@ -211,7 +226,7 @@ export async function getHistory(chatId, type = 'all', limit = 10) {
 
 export async function updateLastActivity(chatId) {
     try {
-        const collection = db.collection('wallet_connections');
+        const collection = db.collection('wallets');
         await collection.updateOne(
             { chatId: String(chatId) },
             { $set: { lastActivity: new Date() } }

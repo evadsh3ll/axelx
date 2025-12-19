@@ -1,10 +1,8 @@
 import TelegramBot from 'node-telegram-bot-api';
 import dotenv from 'dotenv';
 import express from 'express';
-import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 import axios from 'axios';
-import crypto from 'crypto';
 import {
   getAssociatedTokenAddress,
   TOKEN_PROGRAM_ID,
@@ -16,7 +14,8 @@ import { handleNLPCommand } from './handlers/commandHandler.js';
 import { resolveTokenMint } from './utils/tokens.js';
 import { 
     connectToDatabase, 
-    saveWalletConnection, 
+    saveWallet, 
+    getWallet,
     saveRouteHistory, 
     saveTriggerHistory, 
     savePaymentHistory, 
@@ -26,24 +25,65 @@ import {
     updateLastActivity,
     closeDatabase 
 } from './utils/database.js';
+import { createWallet, loadWallet } from './utils/wallet.js';
+import { Connection, Transaction, VersionedTransaction } from '@solana/web3.js';
 // const qr = require('qr-image');
 import qr from "qr-image"
 
-let e_key;
 const app = express();
-const dappKeyPair = nacl.box.keyPair();
-const dappPublicKey = bs58.encode(dappKeyPair.publicKey); // used in connect URL
 dotenv.config();
 const port = process.env.PORT;
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const server_url = process.env.SERVER_URL;
-const userWalletMap = new Map(); // chat_id → walletAddress
-const userSessionMap = new Map(); // chat_id → sessionId
+const WALLET_SECRET = process.env.WALLET_SECRET;
+const userWalletMap = new Map(); // chat_id → walletAddress (public key)
 const bot = new TelegramBot(token, { polling: true });
 app.use(express.json());
-const userPhantomPubkeyMap = new Map(); // chat_id → Phantom's public key
 const notifyWatchers = {}; // To track active notify sessions per chat
 const LAMPORTS_PER_SOL = 1_000_000_000;
+const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+// Helper function to load wallet keypair from database
+async function loadUserWallet(chatId) {
+    if (!WALLET_SECRET) {
+        throw new Error("WALLET_SECRET not configured");
+    }
+    
+    const walletRecord = await getWallet(chatId);
+    if (!walletRecord || !walletRecord.encryptedPrivateKey) {
+        return null;
+    }
+    
+    return loadWallet(walletRecord.encryptedPrivateKey, WALLET_SECRET);
+}
+
+// Helper function to sign and send transaction
+async function signAndSendTransaction(transactionBase64, keypair) {
+    try {
+        // Deserialize transaction
+        const txBuffer = Buffer.from(transactionBase64, 'base64');
+        let transaction;
+        
+        // Try VersionedTransaction first, fallback to Transaction
+        try {
+            transaction = VersionedTransaction.deserialize(txBuffer);
+        } catch {
+            transaction = Transaction.from(txBuffer);
+        }
+        
+        // Sign transaction
+        transaction.sign(keypair);
+        
+        // Serialize signed transaction
+        const signedTxBase64 = transaction.serialize().toString('base64');
+        
+        return signedTxBase64;
+    } catch (error) {
+        console.error("Error signing transaction:", error);
+        throw error;
+    }
+}
 bot.on('polling_error', console.error);
 
 // Connect to database on startup
@@ -75,11 +115,12 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/help/, (msg) => {
     const chatId = msg.chat.id;
-    const helpText = `🤖 *Jupiter Daddy Bot Help*
+    const helpText = `🤖 *AXELX Bot Help*
 
 *Traditional Commands:*
 /start - Start the bot
-/connect - Connect your wallet
+/createwallet - Create your in-app wallet
+/exportwallet - Export your wallet private key
 /about - Check your balance
 /price <token> - Get token price
 /tokens - List available tokens
@@ -91,7 +132,7 @@ bot.onText(/\/help/, (msg) => {
 /history [type] - Show your activity history
 
 *Natural Language Commands (Auto-Execute):*
-• "connect my wallet" → Executes /connect
+• "create wallet" → Executes /createwallet
 • "what's my balance?" → Executes /about
 • "get price of SOL" → Executes /price SOL
 • "get route for 1 SOL to USDC" → Executes /route SOL USDC 1
@@ -101,7 +142,7 @@ bot.onText(/\/help/, (msg) => {
 • "notify me when SOL goes above $100" → Executes /notify SOL above 100
 
 *Examples (All Auto-Execute):*
-• "I want to connect my wallet"
+• "I want to create a wallet"
 • "Show me the price of Bitcoin"
 • "Get me a route for 2 SOL to USDC"
 • "Create a trigger order for 1 SOL to USDC at $45"
@@ -121,29 +162,105 @@ bot.onText(/\/help/, (msg) => {
 • /history price - Price checks
 • /history notification - Notifications
 
+⚠️ *This is a beta demo wallet. Save your private key. Only deposit test funds.*
+
 🚀 *Just type what you want - the bot will automatically execute the commands!*`;
     
     bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
 });
-//Phantom Deeplink
-bot.onText(/\/connect/, async (msg) => {
-    const chatId = msg.chat.id;
-    const { generateConnectLink } = await import('./commands/connect.js');
-    const phantomLink = generateConnectLink(chatId, server_url, dappPublicKey);
-    bot.sendMessage(chatId, `Click to connect your wallet: [Connect Wallet](${phantomLink})`, {
-        parse_mode: 'Markdown'
-    });
+
+// Create wallet command
+bot.onText(/\/createwallet/, async (msg) => {
+    const chatId = String(msg.chat.id);
+    const username = msg.from.username || null;
+
+    if (!WALLET_SECRET) {
+        return bot.sendMessage(chatId, "❌ Server configuration error. Please contact support.");
+    }
+
+    try {
+        // Check if wallet already exists
+        const existingWallet = await getWallet(chatId);
+        if (existingWallet) {
+            return bot.sendMessage(chatId, "⚠️ You already have a wallet. Use /exportwallet to view your private key.");
+        }
+
+        // Create new wallet
+        const walletData = createWallet(WALLET_SECRET);
+        
+        // Save to database
+        await saveWallet(chatId, walletData.publicKey, walletData.encryptedPrivateKey, username);
+        
+        // Update in-memory map
+        userWalletMap.set(chatId, walletData.publicKey);
+
+        const message = `✅ *Your AXELX Wallet is ready*
+
+📝 *Public Key:*
+\`${walletData.publicKey}\`
+
+🔑 *Private Key (SAVE THIS):*
+\`${walletData.privateKey}\`
+
+⚠️ *We cannot recover this for you. Save it securely!*
+
+This is a beta demo wallet. Only deposit test funds.`;
+
+        bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error("Create wallet error:", error);
+        bot.sendMessage(chatId, "❌ Failed to create wallet. Please try again.");
+    }
+});
+
+// Export wallet command
+bot.onText(/\/exportwallet/, async (msg) => {
+    const chatId = String(msg.chat.id);
+
+    if (!WALLET_SECRET) {
+        return bot.sendMessage(chatId, "❌ Server configuration error. Please contact support.");
+    }
+
+    try {
+        const walletRecord = await getWallet(chatId);
+        if (!walletRecord || !walletRecord.encryptedPrivateKey) {
+            return bot.sendMessage(chatId, "❌ No wallet found. Use /createwallet to create one.");
+        }
+
+        // Load wallet to decrypt private key
+        const keypair = loadWallet(walletRecord.encryptedPrivateKey, WALLET_SECRET);
+        const privateKey = bs58.encode(keypair.secretKey);
+
+        const message = `🔑 *Your Wallet Private Key*
+
+📝 *Public Key:*
+\`${walletRecord.publicKey}\`
+
+🔑 *Private Key:*
+\`${privateKey}\`
+
+⚠️ *Keep this private key secure. Anyone with access to it can control your wallet.*`;
+
+        bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error("Export wallet error:", error);
+        bot.sendMessage(chatId, "❌ Failed to export wallet. Please try again.");
+    }
 });
 bot.onText(/\/receivepayment (\d+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
   const username = msg.from.username || null;
-  const merchantWallet = userWalletMap.get(chatId);
-  const phantomEncryptionPubKey = userPhantomPubkeyMap.get(chatId);
-  const amount = Number(match[1]); // in micro USDC (e.g. 1 USDC = 1_000_000)
-
-  if (!merchantWallet || !phantomEncryptionPubKey) {
-    return bot.sendMessage(chatId, "❌ Please connect wallet first using /connect.");
+  
+  // Load wallet from database
+  const walletRecord = await getWallet(chatId);
+  if (!walletRecord) {
+    return bot.sendMessage(chatId, "❌ Please create wallet first using /createwallet.");
   }
+  
+  const merchantWallet = walletRecord.publicKey;
+  userWalletMap.set(chatId, merchantWallet); // Update in-memory map
+  
+  const amount = Number(match[1]); // in micro USDC (e.g. 1 USDC = 1_000_000)
 
   try {
     const merchantPublicKey = new PublicKey(merchantWallet);
@@ -155,66 +272,41 @@ bot.onText(/\/receivepayment (\d+)/, async (msg, match) => {
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
-    const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${USDC_MINT}&amount=${amount}&slippageBps=50&swapMode=ExactOut`;
-    const quote = await (await fetch(quoteUrl)).json();
-
-   const swapRes = await (await fetch(`https://lite-api.jup.ag/swap/v1/swap`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    quoteResponse: quote,
-    userPublicKey: merchantWallet,
-    destinationTokenAccount: merchantUSDCATA.toBase58()
-  })
-})).json();
-
-console.log(swapRes); // 👈 Do this to inspect structure!
-
-    const payload = {
-      transaction: swapRes.swapTransaction,
-      session: "payment" // optional
-    };
-
-    const { encryptPayload } = await import('./commands/connect.js');
-    const { nonce, payload: encryptedPayload } = encryptPayload(payload, phantomEncryptionPubKey, dappKeyPair);
-
-    const redirect = `${server_url}/phantom/ultra-execute?chat_id=${chatId}&order_id=${swapRes.requestId}`;
-    const phantomParams = new URLSearchParams({
-      dapp_encryption_public_key: dappPublicKey,
-      nonce,
-      redirect_link: encodeURIComponent(redirect),
-      payload: encryptedPayload
-    });
-
-    const phantomLink = `https://phantom.app/ul/v1/signTransaction?${phantomParams.toString()}`;
-    console.log(phantomLink)
-    const qrData = qr.imageSync(phantomLink, { type: 'png' });
-
     // Save payment history
     await savePaymentHistory(chatId, amount, 'receive', null, username);
 
-    await bot.sendPhoto(chatId, qrData, {
-      caption: `🧾 Payment request: Pay ${amount / 1e6} USDC\n[Click here to pay with SOL](${phantomLink})`,
-      parse_mode: "Markdown"
-    });
+    const message = `🧾 *Payment Request*
+
+💰 Amount: ${amount / 1e6} USDC
+
+📝 *Your Wallet Address:*
+\`${merchantWallet}\`
+
+💡 Share this address with the payer to receive payment.`;
+
+    await bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
 
   } catch (err) {
     console.error("/receivepayment error:", err);
-    bot.sendMessage(chatId, "❌ Failed to generate payment link.");
+    bot.sendMessage(chatId, "❌ Failed to generate payment request.");
   }
 });
 
 bot.onText(/\/payto (\w{32,44}) (\d+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
   const username = msg.from.username || null;
-  const payerWallet = userWalletMap.get(chatId);
-  const phantomEncryptionPubKey = userPhantomPubkeyMap.get(chatId);
+  
+  // Load wallet from database
+  const walletRecord = await getWallet(chatId);
+  if (!walletRecord) {
+    return bot.sendMessage(chatId, "❌ Please create wallet first using /createwallet.");
+  }
+  
+  const payerWallet = walletRecord.publicKey;
+  userWalletMap.set(chatId, payerWallet); // Update in-memory map
+  
   const merchantWallet = match[1];
   const amount = Number(match[2]); // in micro USDC
-
-  if (!payerWallet || !phantomEncryptionPubKey) {
-    return bot.sendMessage(chatId, "❌ Connect your wallet first using /connect.");
-  }
 
   try {
     const merchantPublicKey = new PublicKey(merchantWallet);
@@ -239,44 +331,51 @@ bot.onText(/\/payto (\w{32,44}) (\d+)/, async (msg, match) => {
       })
     })).json();
 
-    const payload = {
-      transaction: swapRes.swapTransaction,
-      session: "payment"
-    };
+    if (!swapRes.swapTransaction) {
+      return bot.sendMessage(chatId, "❌ Failed to create swap transaction.");
+    }
 
-    const { encryptPayload } = await import('./commands/connect.js');
-    const { nonce, payload: encryptedPayload } = encryptPayload(payload, phantomEncryptionPubKey, dappKeyPair);
-    const redirect = `${server_url}/phantom/ultra-execute?chat_id=${chatId}&order_id=${swapRes.requestId}`;
+    // Load wallet and sign transaction
+    const keypair = await loadUserWallet(chatId);
+    if (!keypair) {
+      return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
+    }
 
-    const phantomParams = new URLSearchParams({
-      dapp_encryption_public_key: dappPublicKey,
-      nonce,
-      redirect_link: encodeURIComponent(redirect),
-      payload: encryptedPayload
+    const signedTxBase64 = await signAndSendTransaction(swapRes.swapTransaction, keypair);
+
+    // Execute the signed transaction
+    const execRes = await axios.post("https://lite-api.jup.ag/ultra/v1/execute", {
+      signedTransaction: signedTxBase64,
+      requestId: swapRes.requestId
     });
 
-    const phantomLink = `https://phantom.app/ul/v1/signTransaction?${phantomParams.toString()}`;
+    const { signature, status } = execRes.data;
 
     // Save payment history
     await savePaymentHistory(chatId, amount, 'send', merchantWallet, username);
 
-    await bot.sendMessage(chatId, `💸 [Click here to pay ${amount / 1e6} USDC to merchant](${phantomLink})`, {
+    await bot.sendMessage(chatId, `✅ *Payment Executed!*\n\n💸 Amount: ${amount / 1e6} USDC\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
       parse_mode: "Markdown"
     });
 
   } catch (err) {
     console.error("/payto error:", err);
-    bot.sendMessage(chatId, "❌ Failed to generate payment transaction.");
+    bot.sendMessage(chatId, `❌ Failed to execute payment: ${err.message}`);
   }
 });
 
 //ULTRA API balance
 bot.onText(/\/about/, async (msg) => {
     const chatId = String(msg.chat.id);
-    const wallet = userWalletMap.get(chatId);
-    if (!wallet) {
-        return bot.sendMessage(chatId, "❌ You haven't connected your wallet yet. Use /connect first.");
+    
+    // Load wallet from database
+    const walletRecord = await getWallet(chatId);
+    if (!walletRecord) {
+        return bot.sendMessage(chatId, "❌ You haven't created your wallet yet. Use /createwallet first.");
     }
+    
+    const wallet = walletRecord.publicKey;
+    userWalletMap.set(chatId, wallet); // Update in-memory map
 
     try {
         const response = await axios.get(`https://lite-api.jup.ag/ultra/v1/balances/${wallet}`);
@@ -356,12 +455,15 @@ bot.onText(/\/tokens/, async (msg) => {
 bot.onText(/\/trigger (.+)/, async (msg, match) => {
     const chatId = String(msg.chat.id);
     const username = msg.from.username || null;
-    const wallet = userWalletMap.get(chatId);
-    const session = userSessionMap.get(chatId);
-
-    if (!wallet || !session) {
-        return bot.sendMessage(chatId, "❌ You haven't connected your wallet yet. Use /connect first.");
+    
+    // Load wallet from database
+    const walletRecord = await getWallet(chatId);
+    if (!walletRecord) {
+        return bot.sendMessage(chatId, "❌ You haven't created your wallet yet. Use /createwallet first.");
     }
+    
+    const wallet = walletRecord.publicKey;
+    userWalletMap.set(chatId, wallet); // Update in-memory map
 
     const args = match[1].trim().split(" ");
 
@@ -433,77 +535,58 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
 
         const orderId = createRes.data?.requestId;
         const txBase58 = createRes.data?.transaction;
-        // Phantom's public key (you get this in the connect step earlier)
-        const phantomEncryptionPubKey = userPhantomPubkeyMap.get(chatId); // <-- you MUST save this in /phantom/callback
-
-        if (!phantomEncryptionPubKey) {
-            return bot.sendMessage(chatId, "❌ Missing Phantom encryption public key. Try /connect again.");
-        }
-
-        // 1. Generate a fresh nonce
-        const nonce = nacl.randomBytes(24);
-        const nonceB58 = bs58.encode(nonce);
-
-        // 2. Create shared secret using Phantom's pubkey + your private key
-        const sharedSecret = nacl.box.before(
-            bs58.decode(phantomEncryptionPubKey),
-            dappKeyPair.secretKey
-        );
-
-        // 3. Encrypt payload
-        const payloadJson = JSON.stringify({
-            transaction: txBase58,
-            session: session
-        });
-        const encryptedPayload = nacl.box.after(
-            Buffer.from(payloadJson),
-            nonce,
-            sharedSecret
-        );
-        const encryptedPayloadB58 = bs58.encode(encryptedPayload);
 
         if (!orderId || !txBase58) {
             return bot.sendMessage(chatId, "⚠️ Failed to create order.");
         }
 
+        // Load wallet and sign transaction
+        const keypair = await loadUserWallet(chatId);
+        if (!keypair) {
+            return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
+        }
+
+        // Convert base58 transaction to base64 and sign
+        const txBuffer = bs58.decode(txBase58);
+        const signedTxBase64 = await signAndSendTransaction(txBuffer.toString('base64'), keypair);
+
+        // Execute the signed transaction
+        const execRes = await axios.post("https://lite-api.jup.ag/trigger/v1/execute", {
+            signedTransaction: signedTxBase64,
+            requestId: orderId
+        }, {
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const { signature, status } = execRes.data;
+
         // Save trigger history
         await saveTriggerHistory(chatId, inputMint, outputMint, amount, targetPrice, orderId, username);
 
-        // 2. Generate Phantom signing link
-        const redirectLink = `${server_url}/phantom/execute?chat_id=${chatId}&order_id=${orderId}`;
-        const phantomParams = new URLSearchParams({
-            dapp_encryption_public_key: dappPublicKey,
-            nonce: nonceB58,
-            redirect_link: encodeURIComponent(redirectLink), // ✅ encode this!
-            payload: encryptedPayloadB58
-
-        });
-
-        const phantomLink = `https://phantom.app/ul/v1/signTransaction?${phantomParams.toString()}`;
-
-        // 3. Ask user to sign
-        await bot.sendMessage(chatId, `✅ Limit order created!\n🆔 Order ID: \`${orderId}\`\n\nPlease sign the transaction using Phantom: [Sign Transaction](${phantomLink})`, {
+        await bot.sendMessage(chatId, `✅ *Limit order created and executed!*\n\n🆔 Order ID: \`${orderId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
             parse_mode: "Markdown"
         });
 
     } catch (err) {
         console.error("Trigger error:", err?.response?.data || err.message);
-        bot.sendMessage(chatId, "❌ Failed to create trigger.");
+        bot.sendMessage(chatId, `❌ Failed to create trigger: ${err.message}`);
     }
 });
 //ULTRA API 
 bot.onText(/\/route (.+)/, async (msg, match) => {
     const chatId = String(msg.chat.id);
     const username = msg.from.username || null;
-    const wallet = userWalletMap.get(chatId);
-    const session = userSessionMap.get(chatId);
-    const phantomEncryptionPubKey = userPhantomPubkeyMap.get(chatId);
+    
+    // Load wallet from database
+    const walletRecord = await getWallet(chatId);
+    if (!walletRecord) {
+        return bot.sendMessage(chatId, "❌ You must create your wallet first. Use /createwallet.");
+    }
+    
+    const wallet = walletRecord.publicKey;
+    userWalletMap.set(chatId, wallet); // Update in-memory map
 
     const input = match[1]?.trim()?.split(" ");
-    if (!wallet || !session || !phantomEncryptionPubKey) {
-        return bot.sendMessage(chatId, "❌ You must connect your wallet first. Use /connect.");
-    }
-
     if (!input || input.length !== 3) {
         return bot.sendMessage(chatId, "❌ Usage:\n/route <inputMint> <outputMint> <amountInLamports>");
     }
@@ -570,40 +653,28 @@ ${retried ? "⚠️ *Insufficient balance. Preview only.*" : ""}
     }
 
     try {
-        // Encrypt transaction with Phantom pubkey
-        const nonce = nacl.randomBytes(24);
-        const nonceB58 = bs58.encode(nonce);
+        // Load wallet and sign transaction
+        const keypair = await loadUserWallet(chatId);
+        if (!keypair) {
+            return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
+        }
 
-        const sharedSecret = nacl.box.before(
-            bs58.decode(phantomEncryptionPubKey),
-            dappKeyPair.secretKey
-        );
+        const signedTxBase64 = await signAndSendTransaction(transaction, keypair);
 
-        const payloadJson = JSON.stringify({
-            transaction: transaction, // base64 encoded from Ultra
-            session: session
+        // Execute the signed transaction
+        const execRes = await axios.post("https://lite-api.jup.ag/ultra/v1/execute", {
+            signedTransaction: signedTxBase64,
+            requestId: requestId
         });
 
-        const encryptedPayload = nacl.box.after(Buffer.from(payloadJson), nonce, sharedSecret);
-        const encryptedPayloadB58 = bs58.encode(encryptedPayload);
+        const { signature, status } = execRes.data;
 
-        const redirectLink = `${server_url}/phantom/ultra-execute?chat_id=${chatId}&order_id=${requestId}`;
-
-        const phantomParams = new URLSearchParams({
-            dapp_encryption_public_key: dappPublicKey,
-            nonce: nonceB58,
-            redirect_link: encodeURIComponent(redirectLink),
-            payload: encryptedPayloadB58
-        });
-
-        const phantomLink = `https://phantom.app/ul/v1/signTransaction?${phantomParams.toString()}`;
-
-        routeDetails += `\n\n✅ [Sign and Execute Transaction](${phantomLink})`;
+        routeDetails += `\n\n✅ *Transaction Executed!*\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`;
 
         await bot.sendMessage(chatId, routeDetails, { parse_mode: "Markdown" });
     } catch (err) {
-        console.error("Encryption/signing error:", err);
-        bot.sendMessage(chatId, "❌ Failed to prepare transaction for Phantom.");
+        console.error("Signing/execution error:", err);
+        bot.sendMessage(chatId, `❌ Failed to sign and execute transaction: ${err.message}`);
     }
 });
 
@@ -710,13 +781,15 @@ bot.on('callback_query', async (query) => {
 
         if (data.startsWith('cancel_')) {
             const orderId = data.replace('cancel_', '');
-            const wallet = userWalletMap.get(chatId);
-            const session = userSessionMap.get(chatId);
-            const phantomEncryptionPubKey = userPhantomPubkeyMap.get(chatId);
-
-            if (!wallet || !session || !phantomEncryptionPubKey) {
-                return bot.sendMessage(chatId, "❌ Missing wallet/session. Use /connect again.");
+            
+            // Load wallet from database
+            const walletRecord = await getWallet(String(chatId));
+            if (!walletRecord) {
+                return bot.sendMessage(chatId, "❌ Missing wallet. Use /createwallet first.");
             }
+            
+            const wallet = walletRecord.publicKey;
+            userWalletMap.set(String(chatId), wallet);
 
             const cancelPayload = {
                 maker: wallet,
@@ -733,34 +806,34 @@ bot.on('callback_query', async (query) => {
                 return bot.sendMessage(chatId, "❌ Failed to get cancellation transaction.");
             }
 
-            const nonce = nacl.randomBytes(24);
-            const nonceB58 = bs58.encode(nonce);
-            const sharedSecret = nacl.box.before(
-                bs58.decode(phantomEncryptionPubKey),
-                dappKeyPair.secretKey
-            );
+            try {
+                // Load wallet and sign transaction
+                const keypair = await loadUserWallet(String(chatId));
+                if (!keypair) {
+                    return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
+                }
 
-            const payloadJson = JSON.stringify({
-                transaction: txBase58,
-                session: session
-            });
+                // Convert base58 transaction to base64 and sign
+                const txBuffer = bs58.decode(txBase58);
+                const signedTxBase64 = await signAndSendTransaction(txBuffer.toString('base64'), keypair);
 
-            const encryptedPayload = nacl.box.after(Buffer.from(payloadJson), nonce, sharedSecret);
-            const encryptedPayloadB58 = bs58.encode(encryptedPayload);
+                // Execute the signed transaction
+                const execRes = await axios.post("https://lite-api.jup.ag/trigger/v1/execute", {
+                    signedTransaction: signedTxBase64,
+                    requestId: orderId
+                }, {
+                    headers: { 'Content-Type': 'application/json' }
+                });
 
-            const redirectLink = `${server_url}/phantom/execute?chat_id=${chatId}&order_id=${orderId}`;
-            const phantomParams = new URLSearchParams({
-                dapp_encryption_public_key: dappPublicKey,
-                nonce: nonceB58,
-                redirect_link: encodeURIComponent(redirectLink),
-                payload: encryptedPayloadB58
-            });
+                const { signature, status } = execRes.data;
 
-            const phantomLink = `https://phantom.app/ul/v1/signTransaction?${phantomParams.toString()}`;
-
-            return bot.sendMessage(chatId, `⚠️ *Sign to Cancel Order*\n🆔 Order ID: \`${orderId}\`\n\n[Sign Cancel Transaction](${phantomLink})`, {
-                parse_mode: "Markdown"
-            });
+                return bot.sendMessage(chatId, `✅ *Order Cancelled!*\n\n🆔 Order ID: \`${orderId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
+                    parse_mode: "Markdown"
+                });
+            } catch (err) {
+                console.error("Cancel order error:", err);
+                return bot.sendMessage(chatId, `❌ Failed to cancel order: ${err.message}`);
+            }
         }
 
         return bot.sendMessage(chatId, "⚠️ Unknown action.");
@@ -785,7 +858,7 @@ bot.on('message', async (msg) => {
         const intent = await parseIntent(text);
         
         // Use the new command handler for all NLP-based commands
-        await handleNLPCommand(bot, msg, intent, userWalletMap, userSessionMap, userPhantomPubkeyMap, server_url, dappPublicKey, dappKeyPair, toLamports, notifyWatchers);
+        await handleNLPCommand(bot, msg, intent, userWalletMap, toLamports, notifyWatchers);
     } catch (err) {
         console.error('NLP parse failed:', err);
         bot.sendMessage(chatId, "⚠️ NLP parsing failed. Try again.");
@@ -794,169 +867,6 @@ bot.on('message', async (msg) => {
 
 app.get('/', (req, res) => {
     res.send('Telegram Bot is running!');
-});
-// Phantom callback endpoint to handle wallet connection
-app.get('/phantom/callback', async (req, res) => {
-    const { phantom_encryption_public_key, nonce, data, chat_id } = req.query;
-
-    if (!phantom_encryption_public_key || !nonce || !data || !chat_id) {
-        return res.status(400).send("Missing required parameters.");
-    }
-    e_key = phantom_encryption_public_key;
-
-    try {
-        const sharedSecret = nacl.box.before(
-            bs58.decode(phantom_encryption_public_key),
-            dappKeyPair.secretKey
-        );
-
-        const decryptedData = nacl.box.open.after(
-            bs58.decode(data),
-            bs58.decode(nonce),
-            sharedSecret
-        );
-
-        const json = JSON.parse(Buffer.from(decryptedData).toString());
-        console.log("Decrypted Phantom data:", json);
-        const wallet = json.public_key;
-        const sessionId = json.session;
-        userWalletMap.set(String(chat_id), wallet);
-        userSessionMap.set(String(chat_id), sessionId);
-        userPhantomPubkeyMap.set(String(chat_id), phantom_encryption_public_key);
-
-        // Save wallet connection to database
-        await saveWalletConnection(
-            chat_id, 
-            wallet, 
-            null, // username will be set when user sends a message
-            sessionId, 
-            phantom_encryption_public_key
-        );
-
-        bot.sendMessage(chat_id, `✅ Wallet connected: \n${wallet}`);
-
-        res.send(`
-      <html>
-        <body>
-          <h2>✅ Wallet Connected</h2>
-          <p>You can go back to Telegram.</p>
-          <a href="tg://resolve?domain=jupidaddy_bot">👉 Return to Telegram</a>
-        </body>
-      </html>
-    `);
-    } catch (e) {
-        console.error(e);
-        res.status(500).send("Failed to decrypt Phantom data.");
-    }
-});
-
-// Phantom execute endpoint to handle signed transaction execution for TRIGGER API
-app.get("/phantom/execute", async (req, res) => {
-    const { nonce, data, chat_id, order_id } = req.query;
-    console.log("Execute params:", req.query);
-    if (!nonce || !data || !chat_id || !order_id) {
-        return res.status(400).send("❌ Missing parameters.");
-    }
-    if (!e_key) return res.status(400).send("Missing encryption key.");
-    console.log("Using encryption key:", e_key);
-    try {
-
-        const sharedSecret = nacl.box.before(
-            bs58.decode(e_key),
-            dappKeyPair.secretKey
-        );
-
-        const decryptedData = nacl.box.open.after(
-            bs58.decode(data),
-            bs58.decode(nonce),
-            sharedSecret
-        );
-
-        const json = JSON.parse(Buffer.from(decryptedData).toString());
-        // const signedTx = json.transaction;
-        const signedTxBase58 = json.transaction;
-        const signedTxBuffer = bs58.decode(signedTxBase58);
-        const signedTxBase64 = signedTxBuffer.toString("base64");
-
-
-        // ✅ Execute the signed tx with Jupiter
-        const execRes = await axios.post("https://lite-api.jup.ag/trigger/v1/execute", {
-            signedTransaction: signedTxBase64,
-            requestId: order_id
-        }, {
-            headers: { 'Content-Type': 'application/json' }
-        });
-
-        const { signature, status } = execRes.data;
-
-        // Notify user in Telegram
-        bot.sendMessage(chat_id, `✅ Order executed!\n\n🆔 Signature: \`${signature}\`\n📦 Status: ${status}`, {
-            parse_mode: "Markdown"
-        });
-
-        res.send(`
-        <html>
-          <body>
-            <h2>✅ Order Executed</h2>
-            <p>Signature: ${signature}</p>
-            <a href="tg://resolve?domain=jupidaddy_bot">👉 Return to Telegram</a>
-          </body>
-        </html>
-        `);
-    } catch (err) {
-        console.error("Execution error:", err?.response || err.message);
-        res.status(500).send("❌ Failed to execute order.");
-    }
-});
-// Phantom Ultra execute endpoint to handle signed transaction execution for ULTRA API
-app.get("/phantom/ultra-execute", async (req, res) => {
-    const { nonce, data, chat_id, order_id } = req.query;
-    if (!nonce || !data || !chat_id || !order_id) {
-        return res.status(400).send("❌ Missing params.");
-    }
-    if (!e_key) return res.status(400).send("❌ Missing Phantom key.");
-
-    try {
-        const sharedSecret = nacl.box.before(
-            bs58.decode(e_key),
-            dappKeyPair.secretKey
-        );
-
-        const decrypted = nacl.box.open.after(
-            bs58.decode(data),
-            bs58.decode(nonce),
-            sharedSecret
-        );
-
-        const json = JSON.parse(Buffer.from(decrypted).toString());
-        const signedTxBase58 = json.transaction;
-        // const signedTxBase64 = bs58.decode(signedTxBase58).toString("base64");
-const signedTxBase64 = Buffer.from(bs58.decode(signedTxBase58)).toString("base64");
-
-        const execRes = await axios.post("https://lite-api.jup.ag/ultra/v1/execute", {
-            signedTransaction: signedTxBase64,
-            requestId: order_id
-        });
-
-        const { signature, status } = execRes.data;
-
-        bot.sendMessage(chat_id, `✅ Swap Executed!\n🔗 [Solscan](https://solscan.io/tx/${signature})\nStatus: *${status}*`, {
-            parse_mode: "Markdown"
-        });
-
-        res.send(`
-        <html>
-            <body>
-                <h2>✅ Swap Executed</h2>
-                <p>Signature: ${signature}</p>
-                <a href="tg://resolve?domain=jupidaddy_bot">🔙 Back to Telegram</a>
-            </body>
-        </html>
-        `);
-    } catch (err) {
-        console.error("Ultra exec error:", err?.response?.data || err.message);
-        res.status(500).send("❌ Failed to execute transaction.");
-    }
 });
 
 // History command
