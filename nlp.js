@@ -17,15 +17,16 @@ export async function parseIntent(text) {
       messages: [
         {
           role: "system",
-          content: `You are an intent classifier for a Solana DeFi Telegram bot with in-app wallet management. 
+          content: `You are an intent classifier for a Solana DeFi Telegram bot with in-app wallet management. The bot integrates with Jupiter API (Ultra Swap, Trigger Orders, Recurring Orders) for DeFi operations.
 
 Analyze the user's message and return ONLY one of these exact intent names:
 - "create_wallet" - User wants to create a new wallet (e.g., "create wallet", "make a wallet", "set up wallet")
 - "export_wallet" - User wants to export/view their wallet private key (e.g., "export wallet", "show my private key", "get my wallet key")
 - "about_wallet" or "get_balance" - User wants to check their balance (e.g., "what's my balance", "check balance", "show balance")
 - "get_price" - User wants token price information (e.g., "price of SOL", "what's SOL worth", "show me SOL price")
-- "get_route" - User wants a swap route/quote (e.g., "route for 1 SOL to USDC", "swap 2 SOL for USDC", "get route")
-- "trigger_swap" - User wants to create a limit order (e.g., "trigger 1 SOL to USDC at $50", "limit order", "set trigger")
+- "get_route" - User wants a swap route/quote via Ultra Swap API (e.g., "route for 1 SOL to USDC", "swap 2 SOL for USDC", "get route", "ultra swap")
+- "trigger_swap" - User wants to create a limit order via Trigger API (e.g., "trigger 1 SOL to USDC at $50", "limit order", "set trigger")
+- "recurring_order" - User wants to create a recurring/DCA order via Recurring API (e.g., "recurring order 1000 USDC to SOL 10 orders every day", "dollar cost average 500 USDC into SOL over 5 weeks", "recurring swap", "schedule recurring", "DCA", "recurring", "automated orders")
 - "receive_payment" - User wants to receive payment (e.g., "receive 10 USDC", "get payment", "request payment")
 - "pay_to" - User wants to send payment (e.g., "pay 5 USDC to [address]", "send payment", "transfer")
 - "get_tokens" - User wants to see available tokens (e.g., "list tokens", "show tokens", "available tokens")
@@ -37,7 +38,9 @@ Rules:
 2. Be case-sensitive - use exact names as shown
 3. For wallet creation, prefer "create_wallet" over "connect_wallet"
 4. If user mentions exporting/showing private key, use "export_wallet"
-5. Balance checks can be either "about_wallet" or "get_balance"`
+5. Balance checks can be either "about_wallet" or "get_balance"
+6. If user mentions "recurring", "DCA", "dollar cost average", "schedule", or "automated orders", use "recurring_order"
+7. If user mentions "trigger", "limit order", or "price target", use "trigger_swap"`
 
         },
         {
@@ -45,8 +48,8 @@ Rules:
           content: text
         }
       ],
-      temperature: 0.3,
-      max_tokens: 20
+      temperature: 0.2,
+      max_tokens: 30
     });
 
     const intent = completion.choices[0]?.message?.content?.trim().toLowerCase();
@@ -185,8 +188,8 @@ export async function parseTriggerIntent(text) {
           role: "system",
           content: `Extract limit order/trigger parameters from the user's message. Return a valid JSON object with:
 {
-  "inputMint": "token symbol (e.g., SOL, USDC)",
-  "outputMint": "token symbol (e.g., USDC, SOL)",
+  "inputMint": "token symbol (e.g., SOL, USDC, JUP, BONK)",
+  "outputMint": "token symbol (e.g., USDC, SOL, USDT)",
   "amount": number (amount of input token),
   "targetPrice": number (target price in USD)
 }
@@ -195,11 +198,16 @@ Examples:
 - "trigger 1 SOL to USDC at $50" → {"inputMint": "SOL", "outputMint": "USDC", "amount": 1, "targetPrice": 50}
 - "limit order 2 SOL for USDT when price is $45" → {"inputMint": "SOL", "outputMint": "USDT", "amount": 2, "targetPrice": 45}
 - "set trigger for 0.5 SOL to JUP at $100" → {"inputMint": "SOL", "outputMint": "JUP", "amount": 0.5, "targetPrice": 100}
+- "create a trigger order for 1.5 SOL to USDC at price $150" → {"inputMint": "SOL", "outputMint": "USDC", "amount": 1.5, "targetPrice": 150}
+- "I want to trigger 0.1 SOL to BONK at $0.00001" → {"inputMint": "SOL", "outputMint": "BONK", "amount": 0.1, "targetPrice": 0.00001}
+- "make a limit order 3 SOL to USDC at $200" → {"inputMint": "SOL", "outputMint": "USDC", "amount": 3, "targetPrice": 200}
 
 Important:
-- Extract targetPrice as a number (remove $ sign)
-- Extract amount as a number
-- Use uppercase token symbols
+- Extract targetPrice as a number (remove $ sign and any currency symbols)
+- Extract amount as a number (can be decimal like 0.5, 1.5, etc.)
+- Use uppercase token symbols (SOL, USDC, JUP, BONK, etc.)
+- The targetPrice is the price at which the order should execute
+- Minimum order size is 5 USD worth
 - Return ONLY valid JSON, no markdown, no code blocks`
         },
         {
@@ -362,6 +370,114 @@ Important:
     };
   } catch (error) {
     console.error("Error parsing notification intent:", error);
+    return null;
+  }
+}
+
+/**
+ * Extract recurring order parameters from user message
+ * @param {string} text - User's message
+ * @returns {Promise<Object|null>} - Recurring order parameters {inputMint, outputMint, totalAmount, numberOfOrders, intervalDays}
+ */
+export async function parseRecurringIntent(text) {
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        {
+          role: "system",
+          content: `Extract recurring order parameters from the user's message for Jupiter Recurring API (time-based orders). Return a valid JSON object with:
+{
+  "inputMint": "token symbol (e.g., USDC, SOL)",
+  "outputMint": "token symbol (e.g., SOL, USDC, JUP)",
+  "totalAmount": number (total amount in USD or input token),
+  "numberOfOrders": number (number of orders, minimum 2),
+  "intervalDays": number (days between orders, e.g., 1 for daily, 7 for weekly)
+}
+
+Examples:
+- "recurring order 1000 USDC to SOL 10 orders every day" → {"inputMint": "USDC", "outputMint": "SOL", "totalAmount": 1000, "numberOfOrders": 10, "intervalDays": 1}
+- "recurring order 1000 USDC to SOL 10 orders every day" → {"inputMint": "USDC", "outputMint": "SOL", "totalAmount": 1000, "numberOfOrders": 10, "intervalDays": 1}
+- "recurring order 1000 USDC to SOL 10 orders every day" → {"inputMint": "USDC", "outputMint": "SOL", "totalAmount": 1000, "numberOfOrders": 10, "intervalDays": 1}
+- "dollar cost average 500 USDC into SOL over 5 weeks" → {"inputMint": "USDC", "outputMint": "SOL", "totalAmount": 500, "numberOfOrders": 5, "intervalDays": 7}
+- "schedule recurring swap 2000 USDC to JUP 20 times every 2 days" → {"inputMint": "USDC", "outputMint": "JUP", "totalAmount": 2000, "numberOfOrders": 20, "intervalDays": 2}
+- "recurring 100 USDC to SOL weekly for 4 weeks" → {"inputMint": "USDC", "outputMint": "SOL", "totalAmount": 100, "numberOfOrders": 4, "intervalDays": 7}
+- "recurring order 1000 USDC to SOL 10 orders every day" → {"inputMint": "USDC", "outputMint": "SOL", "totalAmount": 1000, "numberOfOrders": 10, "intervalDays": 1}
+- "create recurring order for 500 USDC to JUP 5 orders every 3 days" → {"inputMint": "USDC", "outputMint": "JUP", "totalAmount": 500, "numberOfOrders": 5, "intervalDays": 3}
+
+Important:
+- Extract totalAmount as a number (total amount to invest, remove currency symbols)
+- Extract numberOfOrders as a number (minimum 2, look for "orders", "times", "weeks", etc.)
+- Extract intervalDays as a number (days between orders: "every day" = 1, "every 2 days" = 2, "weekly" = 7, "every week" = 7)
+- Use uppercase token symbols (USDC, SOL, JUP, etc.)
+- "every day" or "daily" = 1 day
+- "every week" or "weekly" = 7 days
+- "every 2 days" = 2 days
+- "over 5 weeks" with 5 orders = 7 days interval
+- Minimum total: 100 USD, minimum per order: 50 USD
+- Return ONLY valid JSON, no markdown, no code blocks`
+        },
+        {
+          role: "user",
+          content: text
+        }
+      ],
+      temperature: 0.2,
+      max_tokens: 150
+    });
+
+    const result = completion.choices[0]?.message?.content?.trim();
+    
+    // Remove markdown code blocks if present
+    const cleaned = result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (parseError) {
+      console.error("JSON parse error in parseRecurringIntent:", parseError, "Raw result:", result);
+      // Try to extract manually if JSON parsing fails
+      const textLower = text.toLowerCase();
+      const usdcMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:USDC|usdc)/i);
+      const solMatch = text.match(/to\s+(SOL|sol)/i);
+      const ordersMatch = text.match(/(\d+)\s*(?:orders?|times?)/i);
+      const dayMatch = text.match(/every\s+(?:(\d+)\s*)?day/i) || text.match(/daily/i);
+      
+      if (usdcMatch && solMatch && ordersMatch) {
+        const totalAmount = parseFloat(usdcMatch[1]);
+        const numberOfOrders = parseInt(ordersMatch[1]);
+        const intervalDays = dayMatch && dayMatch[1] ? parseFloat(dayMatch[1]) : (dayMatch ? 1 : 1);
+        
+        return {
+          inputMint: "USDC",
+          outputMint: "SOL",
+          totalAmount,
+          numberOfOrders,
+          intervalDays
+        };
+      }
+      return null;
+    }
+    
+    // Validate required fields
+    if (!parsed.inputMint || !parsed.outputMint || !parsed.totalAmount || !parsed.numberOfOrders || !parsed.intervalDays) {
+      return null;
+    }
+    
+    // Validate minimums
+    if (parsed.numberOfOrders < 2) {
+      return null;
+    }
+    
+    return {
+      inputMint: parsed.inputMint.toUpperCase(),
+      outputMint: parsed.outputMint.toUpperCase(),
+      totalAmount: parseFloat(parsed.totalAmount),
+      numberOfOrders: parseInt(parsed.numberOfOrders),
+      intervalDays: parseFloat(parsed.intervalDays)
+    };
+  } catch (error) {
+    console.error("Error parsing recurring intent:", error);
     return null;
   }
 }

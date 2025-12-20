@@ -3,7 +3,8 @@ import { resolveTokenMint } from '../utils/tokens.js';
 import { 
     parsePriceIntent, 
     parseRouteIntent, 
-    parseTriggerIntent, 
+    parseTriggerIntent,
+    parseRecurringIntent,
     parsePaymentIntent, 
     parseNotificationIntent 
 } from '../nlp.js';
@@ -11,7 +12,8 @@ import {
     getWallet,
     savePriceCheckHistory, 
     saveRouteHistory, 
-    saveTriggerHistory, 
+    saveTriggerHistory,
+    saveRecurringHistory,
     savePaymentHistory, 
     saveNotificationHistory,
     updateLastActivity 
@@ -163,10 +165,7 @@ export async function handleNLPCommand(bot, msg, intent, userWalletMap, toLampor
                 const amountInLamports = await toLamports({ sol: routeParams.amount });
                 
                 // Call the route command logic
-                const routeResult = await executeRouteCommand(bot, chatId, inputMint, outputMint, amountInLamports.toString(), userWalletMap);
-                
-                // Save route history
-                await saveRouteHistory(chatId, inputMint, outputMint, routeParams.amount, "Route query executed", username);
+                const routeResult = await executeRouteCommand(bot, chatId, inputMint, outputMint, amountInLamports.toString(), userWalletMap, username);
                 
                 return routeResult;
 
@@ -176,23 +175,111 @@ export async function handleNLPCommand(bot, msg, intent, userWalletMap, toLampor
                     return bot.sendMessage(chatId, "❌ Could not parse trigger parameters. Please specify input token, output token, amount, and target price.");
                 }
                 
-                // Execute the trigger command
+                // Show confirmation button
                 const triggerInputMint = resolveTokenMint(triggerParams.inputMint);
                 const triggerOutputMint = resolveTokenMint(triggerParams.outputMint);
                 const triggerAmount = triggerParams.amount;
                 const targetPrice = triggerParams.targetPrice;
                 
-                // Call the trigger command logic
-                const triggerResult = await executeTriggerCommand(bot, chatId, triggerInputMint, triggerOutputMint, triggerAmount, targetPrice, userWalletMap, toLamports);
+                // Create a unique hash for this order request
+                const orderHash = Buffer.from(`${chatId}_${Date.now()}_${triggerAmount}_${targetPrice}`).toString('base64').slice(0, 16);
                 
-                // Save trigger history (we'll need to extract orderId from the result)
-                if (triggerResult && triggerResult.includes('Order ID:')) {
-                    const orderIdMatch = triggerResult.match(/Order ID: `([^`]+)`/);
-                    const orderId = orderIdMatch ? orderIdMatch[1] : null;
-                    await saveTriggerHistory(chatId, triggerInputMint, triggerOutputMint, triggerAmount, targetPrice, orderId, username);
+            // Store pending order details temporarily
+            // Note: pendingOrders should be passed from index.js or use global
+            if (!global.pendingOrders) global.pendingOrders = new Map();
+            global.pendingOrders.set(orderHash, {
+                    chatId,
+                    inputMint: triggerInputMint,
+                    outputMint: triggerOutputMint,
+                    amount: triggerAmount,
+                    targetPrice,
+                    username
+                });
+                
+                // Get token info for display
+                const inputTokenInfo = await getTokenInfoV2(triggerInputMint);
+                const outputTokenInfo = await getTokenInfoV2(triggerOutputMint);
+                
+                const confirmMessage = `⚡ *Trigger Order Confirmation*\n\n` +
+                    `📥 Input: ${triggerAmount} ${inputTokenInfo?.symbol || triggerInputMint.slice(0, 4)}\n` +
+                    `📤 Output: ${outputTokenInfo?.symbol || triggerOutputMint.slice(0, 4)}\n` +
+                    `💰 Target Price: $${targetPrice}\n\n` +
+                    `⚠️ *Minimum order size: 5 USD*\n` +
+                    `Please confirm to create this trigger order:`;
+                
+                return bot.sendMessage(chatId, confirmMessage, {
+                    parse_mode: "Markdown",
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: "✅ Confirm & Create Order", callback_data: `confirm_trigger_${orderHash}` },
+                            { text: "❌ Cancel", callback_data: `cancel_trigger_${orderHash}` }
+                        ]]
+                    }
+                });
+
+            case 'recurring_order':
+                const recurringParams = await parseRecurringIntent(text);
+                if (!recurringParams) {
+                    return bot.sendMessage(chatId, "❌ Could not parse recurring order parameters. Please specify input token, output token, total amount, number of orders, and interval (e.g., 'recurring order 1000 USDC to SOL 10 orders every day').");
                 }
                 
-                return triggerResult;
+                // Show confirmation button (similar to trigger)
+                const recurringInputMint = resolveTokenMint(recurringParams.inputMint);
+                const recurringOutputMint = resolveTokenMint(recurringParams.outputMint);
+                const recurringTotalAmount = recurringParams.totalAmount;
+                const recurringNumberOfOrders = recurringParams.numberOfOrders;
+                const recurringIntervalDays = recurringParams.intervalDays;
+                
+                // Validate minimums
+                const amountPerOrder = recurringTotalAmount / recurringNumberOfOrders;
+                if (recurringTotalAmount < 100) {
+                    return bot.sendMessage(chatId, "❌ Minimum total amount is 100 USD.");
+                }
+                if (amountPerOrder < 50) {
+                    return bot.sendMessage(chatId, `❌ Minimum amount per order is 50 USD. With ${recurringNumberOfOrders} orders, you need at least ${recurringNumberOfOrders * 50} USD total.`);
+                }
+                
+                // Create a unique hash for this order request
+                const recurringOrderHash = Buffer.from(`${chatId}_${Date.now()}_${recurringTotalAmount}_${recurringNumberOfOrders}`).toString('base64').slice(0, 16);
+                
+                // Store pending order details temporarily
+                if (!global.pendingRecurringOrders) global.pendingRecurringOrders = new Map();
+                global.pendingRecurringOrders.set(recurringOrderHash, {
+                    chatId,
+                    inputMint: recurringInputMint,
+                    outputMint: recurringOutputMint,
+                    totalAmount: recurringTotalAmount,
+                    numberOfOrders: recurringNumberOfOrders,
+                    intervalSeconds: Math.floor(recurringIntervalDays * 86400),
+                    username
+                });
+                
+                // Get token info for display
+                const recurringInputTokenInfo = await getTokenInfoV2(recurringInputMint);
+                const recurringOutputTokenInfo = await getTokenInfoV2(recurringOutputMint);
+                
+                const recurringConfirmMessage = `🔄 *Recurring Order Confirmation*\n\n` +
+                    `📥 Input: ${recurringTotalAmount} ${recurringInputTokenInfo?.symbol || recurringInputMint.slice(0, 4)}\n` +
+                    `📤 Output: ${recurringOutputTokenInfo?.symbol || recurringOutputMint.slice(0, 4)}\n` +
+                    `📊 Number of Orders: ${recurringNumberOfOrders}\n` +
+                    `💰 Amount per Order: ${amountPerOrder.toFixed(2)} ${recurringInputTokenInfo?.symbol || 'USD'}\n` +
+                    `⏰ Interval: Every ${recurringIntervalDays} day(s)\n` +
+                    `📅 Total Duration: ${(recurringNumberOfOrders * recurringIntervalDays).toFixed(1)} days\n\n` +
+                    `⚠️ *Requirements:*\n` +
+                    `• Minimum total: 100 USD\n` +
+                    `• Minimum per order: 50 USD\n` +
+                    `• Minimum orders: 2\n\n` +
+                    `Please confirm to create this recurring order:`;
+                
+                return bot.sendMessage(chatId, recurringConfirmMessage, {
+                    parse_mode: "Markdown",
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: "✅ Confirm & Create Order", callback_data: `confirm_recurring_${recurringOrderHash}` },
+                            { text: "❌ Cancel", callback_data: `cancel_recurring_${recurringOrderHash}` }
+                        ]]
+                    }
+                });
 
             case 'receive_payment':
                 const paymentParams = await parsePaymentIntent(text);
@@ -244,7 +331,7 @@ export async function handleNLPCommand(bot, msg, intent, userWalletMap, toLampor
                 return notifyResult;
 
             default:
-                return bot.sendMessage(chatId, `🤔 Sorry, I didn't understand that.\n\nTry saying:\n• "create wallet"\n• "what's my balance?"\n• "get price of SOL"\n• "get route for 1 SOL to USDC"\n• "trigger 1 SOL to USDC at $50"`);
+                return bot.sendMessage(chatId, `🤔 Sorry, I didn't understand that.\n\nTry saying:\n• "create wallet"\n• "what's my balance?"\n• "get price of SOL"\n• "get route for 1 SOL to USDC"\n• "trigger 1 SOL to USDC at $50"\n• "recurring order 1000 USDC to SOL 10 orders every day"`);
         }
     } catch (err) {
         console.error('NLP command handling error:', err);
@@ -253,7 +340,7 @@ export async function handleNLPCommand(bot, msg, intent, userWalletMap, toLampor
 }
 
 // Helper functions to execute the actual commands
-async function executeRouteCommand(bot, chatId, inputMint, outputMint, amount, userWalletMap) {
+async function executeRouteCommand(bot, chatId, inputMint, outputMint, amount, userWalletMap, username = null) {
     // Load wallet from database
     const walletRecord = await getWallet(chatId);
     if (!walletRecord) {
@@ -321,6 +408,9 @@ ${retried ? "⚠️ *Insufficient balance. Preview only.*" : ""}
         return bot.sendMessage(chatId, routeDetails, { parse_mode: "Markdown" });
     }
 
+    // Save route history
+    await saveRouteHistory(chatId, inputMint, outputMint, amount, routeDetails, username);
+
     try {
         // Load wallet and sign transaction
         const keypair = await loadUserWallet(chatId);
@@ -378,40 +468,57 @@ async function executeTriggerCommand(bot, chatId, inputMint, outputMint, amount,
             { headers: getJupiterHeaders() }
         );
 
-        const orderId = createRes.data?.requestId;
-        const txBase58 = createRes.data?.transaction;
+        const requestId = createRes.data?.requestId;
+        const orderId = createRes.data?.order;
+        const txBase64 = createRes.data?.transaction;
 
-        if (!orderId || !txBase58) {
-            return bot.sendMessage(chatId, "⚠️ Failed to create order.");
+        if (!requestId || !txBase64) {
+            const errorMsg = createRes.data?.error || createRes.data?.cause || "Unknown error";
+            return bot.sendMessage(chatId, `❌ Failed to create order.\n\n${errorMsg}`, {
+                parse_mode: "Markdown"
+            });
         }
 
-        // Load wallet and sign transaction
-        const keypair = await loadUserWallet(chatId);
-        if (!keypair) {
-            return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
-        }
-
-        // Convert base58 transaction to base64 and sign
-        const txBuffer = bs58.decode(txBase58);
-        const signedTxBase64 = await signAndSendTransaction(txBuffer.toString('base64'), keypair);
-
-        // Execute the signed transaction
-        const execRes = await axios.post("https://api.jup.ag/trigger/v1/execute", {
-            signedTransaction: signedTxBase64,
-            requestId: orderId
-        }, {
-            headers: getJupiterHeaders()
+        // Store pending order for execution
+        // Note: pendingOrders should be passed from index.js or use global
+        if (!global.pendingOrders) global.pendingOrders = new Map();
+        global.pendingOrders.set(requestId, {
+            chatId,
+            transaction: txBase64,
+            inputMint,
+            outputMint,
+            amount,
+            targetPrice,
+            orderId,
+            requestId
         });
 
-        const { signature, status } = execRes.data;
+        const inputTokenInfo = await getTokenInfoV2(inputMint);
+        const outputTokenInfo = await getTokenInfoV2(outputMint);
+        
+        const orderMessage = `✅ *Order Created Successfully!*\n\n` +
+            `📥 Input: ${amount} ${inputTokenInfo?.symbol || inputMint.slice(0, 4)}\n` +
+            `📤 Output: ${outputTokenInfo?.symbol || outputMint.slice(0, 4)}\n` +
+            `💰 Target Price: $${targetPrice}\n` +
+            `🆔 Request ID: \`${requestId}\`\n\n` +
+            `⚠️ *Order is ready but not executed yet.*\n` +
+            `Click the button below to execute:`;
 
-        return await bot.sendMessage(chatId, `✅ *Limit order created and executed!*\n\n🆔 Order ID: \`${orderId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
-            parse_mode: "Markdown"
+        return await bot.sendMessage(chatId, orderMessage, {
+            parse_mode: "Markdown",
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: "🚀 Execute Order", callback_data: `execute_order_${requestId}` }
+                ]]
+            }
         });
 
     } catch (err) {
         console.error("Trigger error:", err?.response?.data || err.message);
-        return bot.sendMessage(chatId, "❌ Failed to create trigger.");
+        const errorMsg = err?.response?.data?.error || err?.response?.data?.cause || err.message;
+        return bot.sendMessage(chatId, `❌ Failed to create trigger order.\n\n${errorMsg}`, {
+            parse_mode: "Markdown"
+        });
     }
 }
 
@@ -586,10 +693,28 @@ async function executeNotifyCommand(bot, chatId, tokenMint, condition, price, no
 
         const currentPrice = tokenInfo.price;
 
+        // Check immediately on first attempt
+        const shouldNotifyNow =
+            (condition === "above" && currentPrice >= price) ||
+            (condition === "below" && currentPrice <= price);
+
+        if (shouldNotifyNow) {
+            await bot.sendMessage(chatId,
+                `📊 *${tokenInfo.name}* (${tokenInfo.symbol})\n` +
+                `💵 Current Price: $${currentPrice.toFixed(6)}\n\n` +
+                `🎯 *Price target already reached!*\n` +
+                `Target: *${condition}* $${price}\n\n` +
+                `💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`,
+                { parse_mode: "Markdown" }
+            );
+            return;
+        }
+
         await bot.sendMessage(chatId,
             `📊 *${tokenInfo.name}* (${tokenInfo.symbol})\n` +
             `💵 Current Price: $${currentPrice.toFixed(6)}\n\n` +
-            `🔔 Monitoring for price *${condition}* $${price}`,
+            `🔔 Monitoring for price *${condition}* $${price}\n` +
+            `✅ Notification active! Checking every 2 seconds...`,
             { parse_mode: "Markdown" }
         );
 
@@ -600,32 +725,38 @@ async function executeNotifyCommand(bot, chatId, tokenMint, condition, price, no
             try {
                 const priceNow = await getTokenPrice(tokenInfo.id);
                 
-                if (!priceNow) {
-                    console.error(`Failed to fetch price for ${tokenInfo.symbol}`);
+                if (!priceNow || isNaN(priceNow)) {
+                    console.error(`Failed to fetch price for ${tokenInfo.symbol} (${tokenInfo.id})`);
                     return;
                 }
 
-                console.log(`Current price for ${tokenInfo.symbol}: $${priceNow}`);
+                console.log(`[Notify] ${tokenInfo.symbol}: $${priceNow} (target: ${condition} $${price})`);
 
                 const shouldNotify =
                     (condition === "above" && priceNow >= price) ||
                     (condition === "below" && priceNow <= price);
 
                 if (shouldNotify) {
-                    bot.sendMessage(chatId, `🎯 *${tokenInfo.symbol}* is now at $${priceNow.toFixed(4)}!\n\n💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`, {
-                        parse_mode: "Markdown"
-                    });
+                    try {
+                        await bot.sendMessage(chatId, `🎯 *${tokenInfo.symbol}* is now at $${priceNow.toFixed(4)}!\n\n💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`, {
+                            parse_mode: "Markdown"
+                        });
+                    } catch (sendErr) {
+                        console.error(`Failed to send notification message: ${sendErr.message}`);
+                    }
 
                     clearInterval(intervalId);
+                    // Remove from watchers array
+                    if (notifyWatchers[chatId]) {
+                        notifyWatchers[chatId] = notifyWatchers[chatId].filter(id => id !== intervalId);
+                    }
                 }
             } catch (err) {
-                console.error(`Polling error: ${err.message}`);
+                console.error(`Polling error for ${tokenInfo.symbol}: ${err.message}`);
             }
-        }, 10000);
+        }, 2000); // Check every 2 seconds
 
         notifyWatchers[chatId].push(intervalId);
-
-        return bot.sendMessage(chatId, `✅ Notification set up successfully for ${tokenInfo.symbol} ${condition} $${price}`);
 
     } catch (err) {
         console.error("Notify command error:", err.message);

@@ -171,11 +171,37 @@ export async function saveNotificationHistory(chatId, token, condition, targetPr
     }
 }
 
+export async function saveRecurringHistory(chatId, inputMint, outputMint, inAmount, numberOfOrders, interval, orderId, username) {
+    try {
+        const collection = db.collection('recurring_history');
+        const recurringData = {
+            chatId: String(chatId),
+            username,
+            inputMint,
+            outputMint,
+            inAmount,
+            numberOfOrders,
+            interval,
+            orderId,
+            status: 'active',
+            timestamp: new Date()
+        };
+
+        await collection.insertOne(recurringData);
+        console.log(`✅ Recurring history saved for chat ${chatId}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Failed to save recurring history:', error);
+        return false;
+    }
+}
+
 export async function getHistory(chatId, type = 'all', limit = 10) {
     try {
         const collections = {
             'route': 'route_history',
             'trigger': 'trigger_history',
+            'recurring': 'recurring_history',
             'payment': 'payment_history',
             'price': 'price_check_history',
             'notification': 'notification_history',

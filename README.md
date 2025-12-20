@@ -13,10 +13,15 @@ A Telegram bot for Solana DeFi operations with in-app wallet management and natu
 - `/price <token>` - Get token price
 - `/tokens` - List available tokens
 - `/route <input> <output> <amount>` - Get swap route and execute
-- `/trigger <input> <output> <amount> <price>` - Create and execute limit order
+- `/trigger <input> <output> <amount> <price>` - Create trigger order (with confirmation and execute buttons)
+- `/trigger orders` - Show active orders with cancel buttons
+- `/trigger orderhistory` - Show order history
+- `/recurring <input> <output> <totalAmount> <numberOfOrders> <intervalDays>` - Create recurring order (DCA)
+- `/recurring orders` - Show active recurring orders with cancel buttons
+- `/recurring orderhistory` - Show recurring order history
 - `/receivepayment <amount>` - Generate payment request (shows your wallet address)
 - `/payto <wallet> <amount>` - Pay to specific wallet
-- `/notify <token> <above/below> <price>` - Set price alerts
+- `/notify <token> <above/below> <price>` - Set price alerts (checks every 2 seconds)
 - `/history [type]` - View your activity history
 
 ### Natural Language Commands (Auto-Execute)
@@ -27,7 +32,11 @@ The bot supports natural language processing and **automatically executes comman
 - "what's my balance?" → **Executes** `/about`
 - "get price of SOL" → **Executes** `/price SOL`
 - "get route for 1 SOL to USDC" → **Executes** `/route SOL USDC 1`
-- "trigger 1 SOL to USDC at $50" → **Executes** `/trigger SOL USDC 1 50`
+- "trigger 1 SOL to USDC at $50" → Shows confirmation button, then creates order, then shows execute button
+- "show my orders" or "show orders" → Shows active trigger orders with cancel buttons
+- "recurring order 1000 USDC to SOL 10 orders every day" → Shows confirmation button for recurring order
+- "dollar cost average 500 USDC into SOL over 5 weeks" → Shows confirmation button for recurring order
+- "show my recurring orders" → Shows active recurring orders with cancel buttons
 - "receive payment of 10 USDC" → **Executes** `/receivepayment 10000000`
 - "pay 5 USDC to [wallet]" → **Executes** `/payto [wallet] 5000000`
 - "notify me when SOL goes above $100" → **Executes** `/notify SOL above 100`
@@ -63,6 +72,7 @@ GROQ_API_KEY=your_groq_api_key
 MONGODB_URI=your_mongodb_connection_string
 DB_NAME=your_database_name
 WALLET_SECRET=some-long-random-string-for-encryption
+JUP_API_KEY=your_jupiter_api_key  # Required for Jupiter API V2
 PORT=3000
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com  # Optional
 ```
@@ -114,28 +124,78 @@ Bot: ✅ Your AXELX Wallet is ready
      ⚠️ We cannot recover this for you. Save it securely!
 ```
 
+### Trigger Orders Flow:
+1. **Request**: User requests trigger order (via command or natural language)
+   - Example: `/trigger SOL USDC 1 50` or "trigger 1 SOL to USDC at $50"
+2. **Confirmation**: Bot shows order details with confirmation button
+   - User clicks "✅ Confirm & Create Order" or "❌ Cancel"
+3. **Order Creation**: Order is created (not executed yet)
+   - Bot shows order details with "🚀 Execute Order" button
+4. **Execution**: User clicks "Execute Order" button to execute
+   - Transaction is signed and sent to the network
+5. **View Orders**: Use `/trigger orders` to see active orders
+   - Each order has a cancel button
+6. **Cancel**: Click cancel button to cancel an active order
+
+### Prerequisites for Trigger Orders:
+- ✅ Wallet must be created (`/createwallet`)
+- ✅ Minimum order size: **5 USD worth**
+- ✅ Sufficient balance in your wallet
+- ✅ Valid token pairs (e.g., SOL/USDC, SOL/JUP)
+
+### Recurring Orders Flow (Dollar Cost Averaging):
+1. **Request**: User requests recurring order (via command or natural language)
+   - Example: `/recurring USDC SOL 1000 10 1` or "recurring order 1000 USDC to SOL 10 orders every day"
+2. **Confirmation**: Bot shows order details with confirmation button
+   - Shows total amount, number of orders, interval, and amount per order
+   - User clicks "✅ Confirm & Create Order" or "❌ Cancel"
+3. **Order Creation**: Order is created (not executed yet)
+   - Bot shows order details with "🚀 Execute Order" button
+4. **Execution**: User clicks "Execute Order" button to execute
+   - Transaction is signed and sent to the network
+   - Orders will execute automatically at specified intervals
+5. **View Orders**: Use `/recurring orders` to see active recurring orders
+   - Each order has a cancel button
+6. **Cancel**: Click cancel button to cancel an active recurring order
+
+### Prerequisites for Recurring Orders:
+- ✅ Wallet must be created (`/createwallet`)
+- ✅ Minimum total amount: **100 USD**
+- ✅ Minimum per order: **50 USD**
+- ✅ Minimum number of orders: **2**
+- ✅ Sufficient balance in your wallet
+- ✅ Valid token pairs (e.g., USDC/SOL, USDC/JUP)
+
 ### Natural Language Examples (All Auto-Execute):
 - "I want to create a wallet" → **Executes** `/createwallet`
 - "Show me the price of Bitcoin" → **Executes** `/price WBTC`
 - "Get me a route for 2 SOL to USDC" → **Executes** `/route SOL USDC 2` (and automatically executes the swap!)
-- "Create a trigger order for 1 SOL to USDC at $45" → **Executes** `/trigger SOL USDC 1 45` (and automatically executes!)
+- "Create a trigger order for 1 SOL to USDC at $45" → Shows confirmation button → Creates order → Shows execute button
+- "Show my orders" → Shows active trigger orders with cancel buttons
+- "Create recurring order 1000 USDC to SOL 10 orders every day" → Shows confirmation button → Creates order → Shows execute button
+- "Dollar cost average 500 USDC into JUP weekly for 4 weeks" → Shows confirmation button → Creates order → Shows execute button
+- "Show my recurring orders" → Shows active recurring orders with cancel buttons
 - "I need to receive 20 USDC" → **Executes** `/receivepayment 20000000` (shows your wallet address)
 - "Pay 5 USDC to ABC123..." → **Executes** `/payto ABC123... 5000000` (and automatically executes!)
-- "Alert me when JUP goes below $0.5" → **Executes** `/notify JUP below 0.5`
+- "Alert me when JUP goes below $0.5" → **Executes** `/notify JUP below 0.5` (checks every 2 seconds)
 
 ### Key Features:
 - **No manual command typing**: Just describe what you want
-- **Automatic transaction execution**: Routes and triggers are automatically signed and executed
+- **Interactive trigger orders**: Confirmation and execute buttons for safety
+- **Order management**: View and cancel orders with buttons
+- **Automatic transaction execution**: Routes are automatically signed and executed
 - **Automatic parameter conversion**: "1 SOL" automatically becomes the correct lamport amount
 - **Smart token recognition**: "Bitcoin" → WBTC, "Jupiter" → JUP, etc.
 - **Price conversion**: "at $50" automatically becomes the target price parameter
 - **In-app wallet**: No external wallet needed - everything happens in the bot
+- **Real-time price alerts**: Notifications check price every 2 seconds
 
 ## API Integration
 
 The bot integrates with:
 - **Jupiter Aggregator API** - For swaps and routing
 - **Jupiter Trigger API** - For limit orders
+- **Jupiter Recurring API** - For recurring orders (DCA)
 - **Jupiter Ultra API** - For gasless transactions
 - **Solana Web3.js** - For transaction signing and wallet management
 
@@ -145,6 +205,7 @@ The bot uses MongoDB to store:
 - Encrypted wallet private keys
 - Route history
 - Trigger order history
+- Recurring order history
 - Payment history
 - Price check history
 - Notification settings

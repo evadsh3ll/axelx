@@ -17,7 +17,8 @@ import {
     saveWallet, 
     getWallet,
     saveRouteHistory, 
-    saveTriggerHistory, 
+    saveTriggerHistory,
+    saveRecurringHistory,
     savePaymentHistory, 
     savePriceCheckHistory, 
     saveNotificationHistory, 
@@ -41,6 +42,8 @@ const userWalletMap = new Map(); // chat_id → walletAddress (public key)
 const bot = new TelegramBot(token, { polling: true });
 app.use(express.json());
 const notifyWatchers = {}; // To track active notify sessions per chat
+const pendingOrders = new Map(); // requestId → { chatId, transaction, inputMint, outputMint, amount, targetPrice, orderId }
+const pendingRecurringOrders = new Map(); // requestId → { chatId, transaction, inputMint, outputMint, inAmount, numberOfOrders, interval, orderId }
 const LAMPORTS_PER_SOL = 1_000_000_000;
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -127,27 +130,69 @@ bot.onText(/\/help/, (msg) => {
 /price <token> - Get token price
 /tokens - List available tokens
 /route <input> <output> <amount> - Get swap route
-/trigger <input> <output> <amount> <price> - Create limit order
+/trigger <input> <output> <amount> <price> - Create trigger order
+/trigger orders - Show active orders with cancel buttons
+/trigger orderhistory - Show order history
+/recurring <input> <output> <totalAmount> <numberOfOrders> <intervalDays> - Create recurring order
+/recurring orders - Show active recurring orders with cancel buttons
+/recurring orderhistory - Show recurring order history
 /receivepayment <amount> - Generate payment request
 /payto <wallet> <amount> - Pay to specific wallet
-/notify <token> <above/below> <price> - Set price alerts
+/notify <token> <above/below> <price> - Set price alerts (checks every 2 seconds)
 /history [type] - Show your activity history
+
+*Trigger Orders Flow:*
+1️⃣ Request trigger order (via command or natural language)
+2️⃣ Confirm order details with button
+3️⃣ Order is created (not executed yet)
+4️⃣ Click "Execute Order" button to execute
+5️⃣ View orders with /trigger orders
+6️⃣ Cancel orders using cancel buttons
+
+*Prerequisites for Trigger Orders:*
+✅ Wallet must be created (/createwallet)
+✅ Minimum order size: 5 USD worth
+✅ Sufficient balance in your wallet
+✅ Valid token pairs (e.g., SOL/USDC, SOL/JUP)
+
+*Recurring Orders Flow:*
+1️⃣ Request recurring order (via command or natural language)
+2️⃣ Confirm order details with button
+3️⃣ Order is created (not executed yet)
+4️⃣ Click "Execute Order" button to execute
+5️⃣ View orders with /recurring orders
+6️⃣ Cancel orders using cancel buttons
+
+*Prerequisites for Recurring Orders:*
+✅ Wallet must be created (/createwallet)
+✅ Minimum total amount: 100 USD
+✅ Minimum per order: 50 USD
+✅ Minimum number of orders: 2
+✅ Sufficient balance in your wallet
+✅ Valid token pairs (e.g., USDC/SOL, USDC/JUP)
 
 *Natural Language Commands (Auto-Execute):*
 • "create wallet" → Executes /createwallet
 • "what's my balance?" → Executes /about
 • "get price of SOL" → Executes /price SOL
 • "get route for 1 SOL to USDC" → Executes /route SOL USDC 1
-• "trigger 1 SOL to USDC at $50" → Executes /trigger SOL USDC 1 50
+• "trigger 1 SOL to USDC at $50" → Shows confirmation button
+• "show my orders" → Shows active trigger orders
+• "recurring order 1000 USDC to SOL 10 orders every day" → Shows confirmation button
+• "dollar cost average 500 USDC into SOL over 5 weeks" → Shows confirmation button
+• "show my recurring orders" → Shows active recurring orders
 • "receive payment of 10 USDC" → Executes /receivepayment 10000000
 • "pay 5 USDC to [wallet]" → Executes /payto [wallet] 5000000
-• "notify me when SOL goes above $100" → Executes /notify SOL above 100
+• "notify me when SOL goes above $100" → Sets price alert (checks every 2s)
 
 *Examples (All Auto-Execute):*
 • "I want to create a wallet"
 • "Show me the price of Bitcoin"
 • "Get me a route for 2 SOL to USDC"
 • "Create a trigger order for 1 SOL to USDC at $45"
+• "Show my trigger orders"
+• "Create recurring order 1000 USDC to SOL 10 orders every day"
+• "Dollar cost average 500 USDC into JUP weekly for 4 weeks"
 • "I need to receive 20 USDC"
 • "Alert me when JUP goes below $0.5"
 
@@ -160,6 +205,7 @@ bot.onText(/\/help/, (msg) => {
 • /history - All activities
 • /history route - Route queries
 • /history trigger - Trigger orders
+• /history recurring - Recurring orders
 • /history payment - Payment history
 • /history price - Price checks
 • /history notification - Notifications
@@ -481,13 +527,38 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
 
     const args = match[1].trim().split(" ");
 
-    if (args[0] === 'orders') {
-        const res = await axios.get(`https://api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=active`, {
-            headers: getJupiterHeaders()
-        });
-        if (!res.data.length) return bot.sendMessage(chatId, "📭 No active orders.");
-        const orders = res.data.map(o => `• 🆔 ${o.order} (${o.params.makingAmount} → ${o.params.takingAmount})`);
-        return bot.sendMessage(chatId, `📋 *Active Orders*\n\n${orders.join('\n')}`, { parse_mode: "Markdown" });
+    if (args[0] === 'orders' || args[0] === 'show' || args[0] === 'list') {
+        try {
+            const res = await axios.get(`https://api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=active`, {
+                headers: getJupiterHeaders()
+            });
+            
+            // Check if response is valid and has data
+            if (!res || !res.data || !Array.isArray(res.data) || res.data.length === 0) {
+                return bot.sendMessage(chatId, "📭 No active orders.");
+            }
+            
+            const keyboard = res.data.map(o => [{
+                text: `🗑️ Cancel Order ${o.order?.slice(0, 8) || 'Unknown'}...`,
+                callback_data: `cancel_${o.order}`
+            }]);
+            
+            const ordersText = res.data.map((o, idx) => {
+                const inputAmount = Number(o.params?.makingAmount || 0) / 1e9;
+                const outputAmount = Number(o.params?.takingAmount || 0) / 1e6;
+                return `${idx + 1}. 🆔 \`${o.order || 'Unknown'}\`\n   📥 ${inputAmount} → 📤 ${outputAmount}`;
+            }).join('\n\n');
+            
+            return bot.sendMessage(chatId, `📋 *Active Orders*\n\n${ordersText}\n\n*Select an order to cancel:*`, {
+                parse_mode: "Markdown",
+                reply_markup: {
+                    inline_keyboard: keyboard
+                }
+            });
+        } catch (err) {
+            console.error("Error fetching trigger orders:", err?.response?.data || err.message);
+            return bot.sendMessage(chatId, "📭 No active orders or error fetching orders.");
+        }
     }
 
     if (args[0] === 'orderhistory') {
@@ -519,13 +590,12 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
 
     // Default fallback to actual order trigger
     if (args.length !== 4) {
-        return bot.sendMessage(chatId, `⚠️ Usage:\n/trigger <inputMint> <outputMint> <amount> <targetPrice>\n/trigger orders\n/trigger orderhistory\n/trigger cancelorder`);
+        return bot.sendMessage(chatId, `⚠️ Usage:\n/trigger <inputMint> <outputMint> <amount> <targetPrice>\n/trigger orders - Show active orders\n/trigger orderhistory - Show order history`);
     }
 
     const [inputMintName, outputMintName, amountStr, targetPriceStr] = args;
     const inputMint = resolveTokenMint(inputMintName);
     const outputMint = resolveTokenMint(outputMintName);
-    console.log(inputMint,outputMint)
     const amount = parseFloat(amountStr);
     const targetPrice = parseFloat(targetPriceStr);
 
@@ -533,65 +603,181 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
         return bot.sendMessage(chatId, "❌ Invalid amount or price.");
     }
 
-    try {
-        // 1. Create the order
-        const createPayload = {
-            inputMint,
-            outputMint,
-            maker: wallet,
-            payer: wallet,
-            params: {
-                makingAmount:(await toLamports({ sol: amount })).toString(),
-                takingAmount: (await toLamports({ usd: amount * targetPrice })).toString()
-            },
-            computeUnitPrice: "auto"
-        };
-
-        const createRes = await axios.post(
-            "https://api.jup.ag/trigger/v1/createOrder",
-            createPayload,
-            { headers: getJupiterHeaders() }
-        );
-
-        const orderId = createRes.data?.requestId;
-        const txBase58 = createRes.data?.transaction;
-
-        if (!orderId || !txBase58) {
-            return bot.sendMessage(chatId, "⚠️ Failed to create order.");
+    // Show confirmation button
+    const orderHash = Buffer.from(`${chatId}_${Date.now()}_${amount}_${targetPrice}`).toString('base64').slice(0, 16);
+    
+    // Store pending order details temporarily
+    pendingOrders.set(orderHash, {
+        chatId,
+        inputMint,
+        outputMint,
+        amount,
+        targetPrice,
+        username
+    });
+    
+    // Get token info for display
+    const inputTokenInfo = await getTokenInfoV2(inputMint);
+    const outputTokenInfo = await getTokenInfoV2(outputMint);
+    
+    const confirmMessage = `⚡ *Trigger Order Confirmation*\n\n` +
+        `📥 Input: ${amount} ${inputTokenInfo?.symbol || inputMint.slice(0, 4)}\n` +
+        `📤 Output: ${outputTokenInfo?.symbol || outputMint.slice(0, 4)}\n` +
+        `💰 Target Price: $${targetPrice}\n\n` +
+        `⚠️ *Minimum order size: 5 USD*\n` +
+        `Please confirm to create this trigger order:`;
+    
+    return bot.sendMessage(chatId, confirmMessage, {
+        parse_mode: "Markdown",
+        reply_markup: {
+            inline_keyboard: [[
+                { text: "✅ Confirm & Create Order", callback_data: `confirm_trigger_${orderHash}` },
+                { text: "❌ Cancel", callback_data: `cancel_trigger_${orderHash}` }
+            ]]
         }
-
-        // Load wallet and sign transaction
-        const keypair = await loadUserWallet(chatId);
-        if (!keypair) {
-            return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
-        }
-
-        // Convert base58 transaction to base64 and sign
-        const txBuffer = bs58.decode(txBase58);
-        const signedTxBase64 = await signAndSendTransaction(txBuffer.toString('base64'), keypair);
-
-        // Execute the signed transaction
-        const execRes = await axios.post("https://api.jup.ag/trigger/v1/execute", {
-            signedTransaction: signedTxBase64,
-            requestId: orderId
-        }, {
-            headers: getJupiterHeaders()
-        });
-
-        const { signature, status } = execRes.data;
-
-        // Save trigger history
-        await saveTriggerHistory(chatId, inputMint, outputMint, amount, targetPrice, orderId, username);
-
-        await bot.sendMessage(chatId, `✅ *Limit order created and executed!*\n\n🆔 Order ID: \`${orderId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
-            parse_mode: "Markdown"
-        });
-
-    } catch (err) {
-        console.error("Trigger error:", err?.response?.data || err.message);
-        bot.sendMessage(chatId, `❌ Failed to create trigger: ${err.message}`);
-    }
+    });
 });
+
+//RECURRING API
+bot.onText(/\/recurring (.+)/, async (msg, match) => {
+    const chatId = String(msg.chat.id);
+    const username = msg.from.username || null;
+    
+    // Load wallet from database
+    const walletRecord = await getWallet(chatId);
+    if (!walletRecord) {
+        return bot.sendMessage(chatId, "❌ You haven't created your wallet yet. Use /createwallet first.");
+    }
+    
+    const wallet = walletRecord.publicKey;
+    userWalletMap.set(chatId, wallet);
+
+    const args = match[1].trim().split(" ");
+
+    if (args[0] === 'orders' || args[0] === 'show' || args[0] === 'list') {
+        try {
+            const res = await axios.get(`https://api.jup.ag/recurring/v1/getRecurringOrders?user=${wallet}&orderStatus=active&recurringType=time`, {
+                headers: getJupiterHeaders()
+            });
+            
+            if (!res || !res.data || !Array.isArray(res.data) || res.data.length === 0) {
+                return bot.sendMessage(chatId, "📭 No active recurring orders.");
+            }
+            
+            const keyboard = res.data.map(o => [{
+                text: `🗑️ Cancel Order ${o.order?.slice(0, 8) || 'Unknown'}...`,
+                callback_data: `cancel_recurring_order_${o.order}`
+            }]);
+            
+            const ordersText = res.data.map((o, idx) => {
+                const inAmount = Number(o.params?.time?.inAmount || 0) / 1e6; // Assuming USDC
+                const numOrders = o.params?.time?.numberOfOrders || 0;
+                const interval = o.params?.time?.interval || 0;
+                const intervalDays = Math.floor(interval / 86400);
+                return `${idx + 1}. 🆔 \`${o.order || 'Unknown'}\`\n   💰 ${inAmount} USDC\n   📊 ${numOrders} orders, every ${intervalDays} day(s)`;
+            }).join('\n\n');
+            
+            return bot.sendMessage(chatId, `📋 *Active Recurring Orders*\n\n${ordersText}\n\n*Select an order to cancel:*`, {
+                parse_mode: "Markdown",
+                reply_markup: {
+                    inline_keyboard: keyboard
+                }
+            });
+        } catch (err) {
+            console.error("Error fetching recurring orders:", err?.response?.data || err.message);
+            return bot.sendMessage(chatId, "📭 No active recurring orders or error fetching orders.");
+        }
+    }
+
+    if (args[0] === 'orderhistory') {
+        try {
+            const res = await axios.get(`https://api.jup.ag/recurring/v1/getRecurringOrders?user=${wallet}&orderStatus=history&recurringType=time`, {
+                headers: getJupiterHeaders()
+            });
+            if (!res.data || !Array.isArray(res.data) || res.data.length === 0) {
+                return bot.sendMessage(chatId, "📭 No recurring order history found.");
+            }
+            const orders = res.data.map((o, idx) => {
+                const inAmount = Number(o.params?.time?.inAmount || 0) / 1e6;
+                const numOrders = o.params?.time?.numberOfOrders || 0;
+                return `${idx + 1}. 🆔 ${o.order} (${inAmount} USDC, ${numOrders} orders)`;
+            });
+            return bot.sendMessage(chatId, `📜 *Recurring Order History*\n\n${orders.join('\n')}`, { parse_mode: "Markdown" });
+        } catch (err) {
+            console.error("Error fetching recurring order history:", err);
+            return bot.sendMessage(chatId, "📭 No recurring order history found.");
+        }
+    }
+
+    // Default: Create recurring order
+    // Format: /recurring <inputMint> <outputMint> <totalAmount> <numberOfOrders> <intervalDays>
+    if (args.length !== 5) {
+        return bot.sendMessage(chatId, `⚠️ Usage:\n/recurring <inputMint> <outputMint> <totalAmount> <numberOfOrders> <intervalDays>\n/recurring orders - Show active orders\n/recurring orderhistory - Show order history\n\nExample: /recurring USDC SOL 1000 10 1\n(1000 USDC total, 10 orders, every 1 day)`);
+    }
+
+    const [inputMintName, outputMintName, totalAmountStr, numberOfOrdersStr, intervalDaysStr] = args;
+    const inputMint = resolveTokenMint(inputMintName);
+    const outputMint = resolveTokenMint(outputMintName);
+    const totalAmount = parseFloat(totalAmountStr);
+    const numberOfOrders = parseInt(numberOfOrdersStr);
+    const intervalDays = parseFloat(intervalDaysStr);
+    const intervalSeconds = Math.floor(intervalDays * 86400);
+
+    if (isNaN(totalAmount) || isNaN(numberOfOrders) || isNaN(intervalDays) || numberOfOrders < 2) {
+        return bot.sendMessage(chatId, "❌ Invalid parameters. Minimum 2 orders required.");
+    }
+
+    // Validate minimums: 100 USD total, 50 USD per order
+    const amountPerOrder = totalAmount / numberOfOrders;
+    if (totalAmount < 100) {
+        return bot.sendMessage(chatId, "❌ Minimum total amount is 100 USD.");
+    }
+    if (amountPerOrder < 50) {
+        return bot.sendMessage(chatId, `❌ Minimum amount per order is 50 USD. With ${numberOfOrders} orders, you need at least ${numberOfOrders * 50} USD total.`);
+    }
+
+    // Show confirmation button
+    const orderHash = Buffer.from(`${chatId}_${Date.now()}_${totalAmount}_${numberOfOrders}`).toString('base64').slice(0, 16);
+    
+    // Store pending order details temporarily
+    pendingRecurringOrders.set(orderHash, {
+        chatId,
+        inputMint,
+        outputMint,
+        totalAmount,
+        numberOfOrders,
+        intervalSeconds,
+        username
+    });
+    
+    // Get token info for display
+    const inputTokenInfo = await getTokenInfoV2(inputMint);
+    const outputTokenInfo = await getTokenInfoV2(outputMint);
+    
+    const confirmMessage = `🔄 *Recurring Order Confirmation*\n\n` +
+        `📥 Input: ${totalAmount} ${inputTokenInfo?.symbol || inputMint.slice(0, 4)}\n` +
+        `📤 Output: ${outputTokenInfo?.symbol || outputMint.slice(0, 4)}\n` +
+        `📊 Number of Orders: ${numberOfOrders}\n` +
+        `💰 Amount per Order: ${amountPerOrder.toFixed(2)} ${inputTokenInfo?.symbol || 'USD'}\n` +
+        `⏰ Interval: Every ${intervalDays} day(s)\n` +
+        `📅 Total Duration: ${(numberOfOrders * intervalDays).toFixed(1)} days\n\n` +
+        `⚠️ *Requirements:*\n` +
+        `• Minimum total: 100 USD\n` +
+        `• Minimum per order: 50 USD\n` +
+        `• Minimum orders: 2\n\n` +
+        `Please confirm to create this recurring order:`;
+    
+    return bot.sendMessage(chatId, confirmMessage, {
+        parse_mode: "Markdown",
+        reply_markup: {
+            inline_keyboard: [[
+                { text: "✅ Confirm & Create Order", callback_data: `confirm_recurring_${orderHash}` },
+                { text: "❌ Cancel", callback_data: `cancel_recurring_${orderHash}` }
+            ]]
+        }
+    });
+});
+
 //ULTRA API 
 bot.onText(/\/route (.+)/, async (msg, match) => {
     const chatId = String(msg.chat.id);
@@ -736,10 +922,28 @@ bot.onText(/\/notify (.+)/, async (msg, match) => {
         // Save notification history
         await saveNotificationHistory(chatId, tokenInfo.id, condition, targetPrice, username);
 
+        // Check immediately on first attempt
+        const shouldNotifyNow =
+            (condition === "above" && currentPrice >= targetPrice) ||
+            (condition === "below" && currentPrice <= targetPrice);
+
+        if (shouldNotifyNow) {
+            await bot.sendMessage(chatId,
+                `📊 *${tokenInfo.name}* (${tokenInfo.symbol})\n` +
+                `💵 Current Price: $${currentPrice.toFixed(6)}\n\n` +
+                `🎯 *Price target already reached!*\n` +
+                `Target: *${condition}* $${targetPrice}\n\n` +
+                `💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`,
+                { parse_mode: "Markdown" }
+            );
+            return;
+        }
+
         await bot.sendMessage(chatId,
             `📊 *${tokenInfo.name}* (${tokenInfo.symbol})\n` +
             `💵 Current Price: $${currentPrice.toFixed(6)}\n\n` +
-            `🔔 Monitoring for price *${condition}* $${targetPrice}`,
+            `🔔 Monitoring for price *${condition}* $${targetPrice}\n` +
+            `✅ Notification active! Checking every 2 seconds...`,
             { parse_mode: "Markdown" }
         );
 
@@ -749,28 +953,36 @@ bot.onText(/\/notify (.+)/, async (msg, match) => {
             try {
                 const priceNow = await getTokenPrice(tokenInfo.id);
                 
-                if (!priceNow) {
-                    console.error(`Failed to fetch price for ${tokenInfo.symbol}`);
+                if (!priceNow || isNaN(priceNow)) {
+                    console.error(`Failed to fetch price for ${tokenInfo.symbol} (${tokenInfo.id})`);
                     return;
                 }
 
-                console.log(`Current price for ${tokenInfo.symbol}: $${priceNow}`);
+                console.log(`[Notify] ${tokenInfo.symbol}: $${priceNow} (target: ${condition} $${targetPrice})`);
 
                 const shouldNotify =
                     (condition === "above" && priceNow >= targetPrice) ||
                     (condition === "below" && priceNow <= targetPrice);
 
                 if (shouldNotify) {
-                    bot.sendMessage(chatId, `🎯 *${tokenInfo.symbol}* is now at $${priceNow.toFixed(4)}!\n\n💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`, {
-                        parse_mode: "Markdown"
-                    });
+                    try {
+                        await bot.sendMessage(chatId, `🎯 *${tokenInfo.symbol}* is now at $${priceNow.toFixed(4)}!\n\n💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`, {
+                            parse_mode: "Markdown"
+                        });
+                    } catch (sendErr) {
+                        console.error(`Failed to send notification message: ${sendErr.message}`);
+                    }
 
                     clearInterval(intervalId);
+                    // Remove from watchers array
+                    if (notifyWatchers[chatId]) {
+                        notifyWatchers[chatId] = notifyWatchers[chatId].filter(id => id !== intervalId);
+                    }
                 }
             } catch (err) {
-                console.error(`Polling error: ${err.message}`);
+                console.error(`Polling error for ${tokenInfo.symbol}: ${err.message}`);
             }
-        }, 10000);
+        }, 2000); // Check every 2 seconds
 
         notifyWatchers[chatId].push(intervalId);
     } catch (err) {
@@ -784,6 +996,9 @@ bot.on('callback_query', async (query) => {
     const data = query.data;
 
     try {
+        // Answer callback to remove loading state
+        await bot.answerCallbackQuery(query.id);
+
         if (data.startsWith('token_')) {
             const mint = data.replace('token_', '');
 
@@ -801,6 +1016,461 @@ bot.on('callback_query', async (query) => {
             });
         }
 
+        // Handle trigger order confirmation
+        if (data.startsWith('confirm_trigger_')) {
+            const orderHash = data.replace('confirm_trigger_', '');
+            const orderData = pendingOrders.get(orderHash);
+            
+            if (!orderData) {
+                // Try global as fallback
+                if (global.pendingOrders) {
+                    const globalData = global.pendingOrders.get(orderHash);
+                    if (globalData) {
+                        // Use global data
+                        const walletRecord = await getWallet(String(chatId));
+                        if (!walletRecord) {
+                            return bot.sendMessage(chatId, "❌ You haven't created your wallet yet. Use /createwallet first.");
+                        }
+                        
+                        const wallet = walletRecord.publicKey;
+                        userWalletMap.set(String(chatId), wallet);
+
+                        try {
+                            const makingAmount = (await toLamports({ sol: globalData.amount })).toString();
+                            const takingAmount = (await toLamports({ usd: globalData.amount * globalData.targetPrice })).toString();
+
+                            const createPayload = {
+                                inputMint: globalData.inputMint,
+                                outputMint: globalData.outputMint,
+                                maker: wallet,
+                                payer: wallet,
+                                params: {
+                                    makingAmount,
+                                    takingAmount
+                                },
+                                computeUnitPrice: "auto"
+                            };
+
+                            const createRes = await axios.post(
+                                "https://api.jup.ag/trigger/v1/createOrder",
+                                createPayload,
+                                { headers: getJupiterHeaders() }
+                            );
+
+                            const requestId = createRes.data?.requestId;
+                            const orderId = createRes.data?.order;
+                            const txBase64 = createRes.data?.transaction;
+
+                            if (!requestId || !txBase64) {
+                                const errorMsg = createRes.data?.error || createRes.data?.cause || "Unknown error";
+                                return bot.sendMessage(chatId, `❌ Failed to create order.\n\n${errorMsg}`, {
+                                    parse_mode: "Markdown"
+                                });
+                            }
+
+                            // Store pending order for execution
+                            pendingOrders.set(requestId, {
+                                chatId: String(chatId),
+                                transaction: txBase64,
+                                inputMint: globalData.inputMint,
+                                outputMint: globalData.outputMint,
+                                amount: globalData.amount,
+                                targetPrice: globalData.targetPrice,
+                                orderId,
+                                requestId
+                            });
+
+                            const inputTokenInfo = await getTokenInfoV2(globalData.inputMint);
+                            const outputTokenInfo = await getTokenInfoV2(globalData.outputMint);
+                            
+                            const orderMessage = `✅ *Order Created Successfully!*\n\n` +
+                                `📥 Input: ${globalData.amount} ${inputTokenInfo?.symbol || globalData.inputMint.slice(0, 4)}\n` +
+                                `📤 Output: ${outputTokenInfo?.symbol || globalData.outputMint.slice(0, 4)}\n` +
+                                `💰 Target Price: $${globalData.targetPrice}\n` +
+                                `🆔 Request ID: \`${requestId}\`\n\n` +
+                                `⚠️ *Order is ready but not executed yet.*\n` +
+                                `Click the button below to execute:`;
+
+                            return await bot.sendMessage(chatId, orderMessage, {
+                                parse_mode: "Markdown",
+                                reply_markup: {
+                                    inline_keyboard: [[
+                                        { text: "🚀 Execute Order", callback_data: `execute_order_${requestId}` }
+                                    ]]
+                                }
+                            });
+
+                        } catch (err) {
+                            console.error("Create order error:", err?.response?.data || err.message);
+                            const errorMsg = err?.response?.data?.error || err?.response?.data?.cause || err.message;
+                            return bot.sendMessage(chatId, `❌ Failed to create trigger order.\n\n${errorMsg}`, {
+                                parse_mode: "Markdown"
+                            });
+                        }
+                    }
+                }
+                return bot.sendMessage(chatId, "❌ Order data not found. Please try again.");
+            }
+            
+            // If orderData exists in pendingOrders, proceed with creation
+            const walletRecord = await getWallet(String(chatId));
+            if (!walletRecord) {
+                return bot.sendMessage(chatId, "❌ You haven't created your wallet yet. Use /createwallet first.");
+            }
+            
+            const wallet = walletRecord.publicKey;
+            userWalletMap.set(String(chatId), wallet);
+
+            try {
+                const makingAmount = (await toLamports({ sol: orderData.amount })).toString();
+                const takingAmount = (await toLamports({ usd: orderData.amount * orderData.targetPrice })).toString();
+
+                const createPayload = {
+                    inputMint: orderData.inputMint,
+                    outputMint: orderData.outputMint,
+                    maker: wallet,
+                    payer: wallet,
+                    params: {
+                        makingAmount,
+                        takingAmount
+                    },
+                    computeUnitPrice: "auto"
+                };
+
+                const createRes = await axios.post(
+                    "https://api.jup.ag/trigger/v1/createOrder",
+                    createPayload,
+                    { headers: getJupiterHeaders() }
+                );
+
+                const requestId = createRes.data?.requestId;
+                const orderId = createRes.data?.order;
+                const txBase64 = createRes.data?.transaction;
+
+                if (!requestId || !txBase64) {
+                    const errorMsg = createRes.data?.error || createRes.data?.cause || "Unknown error";
+                    return bot.sendMessage(chatId, `❌ Failed to create order.\n\n${errorMsg}`, {
+                        parse_mode: "Markdown"
+                    });
+                }
+
+                // Store pending order for execution
+                pendingOrders.set(requestId, {
+                    chatId: String(chatId),
+                    transaction: txBase64,
+                    inputMint: orderData.inputMint,
+                    outputMint: orderData.outputMint,
+                    amount: orderData.amount,
+                    targetPrice: orderData.targetPrice,
+                    orderId,
+                    requestId
+                });
+
+                const inputTokenInfo = await getTokenInfoV2(orderData.inputMint);
+                const outputTokenInfo = await getTokenInfoV2(orderData.outputMint);
+                
+                const orderMessage = `✅ *Order Created Successfully!*\n\n` +
+                    `📥 Input: ${orderData.amount} ${inputTokenInfo?.symbol || orderData.inputMint.slice(0, 4)}\n` +
+                    `📤 Output: ${outputTokenInfo?.symbol || orderData.outputMint.slice(0, 4)}\n` +
+                    `💰 Target Price: $${orderData.targetPrice}\n` +
+                    `🆔 Request ID: \`${requestId}\`\n\n` +
+                    `⚠️ *Order is ready but not executed yet.*\n` +
+                    `Click the button below to execute:`;
+
+                return await bot.sendMessage(chatId, orderMessage, {
+                    parse_mode: "Markdown",
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: "🚀 Execute Order", callback_data: `execute_order_${requestId}` }
+                        ]]
+                    }
+                });
+
+            } catch (err) {
+                console.error("Create order error:", err?.response?.data || err.message);
+                const errorMsg = err?.response?.data?.error || err?.response?.data?.cause || err.message;
+                return bot.sendMessage(chatId, `❌ Failed to create trigger order.\n\n${errorMsg}`, {
+                    parse_mode: "Markdown"
+                });
+            }
+        }
+
+        // Handle trigger order cancellation (before creation)
+        if (data.startsWith('cancel_trigger_')) {
+            const orderHash = data.replace('cancel_trigger_', '');
+            pendingOrders.delete(orderHash);
+            return bot.sendMessage(chatId, "❌ Order creation cancelled.");
+        }
+
+        // Handle order execution
+        if (data.startsWith('execute_order_')) {
+            const requestId = data.replace('execute_order_', '');
+            const orderData = pendingOrders.get(requestId);
+            
+            if (!orderData) {
+                return bot.sendMessage(chatId, "❌ Order not found. It may have expired or already been executed.");
+            }
+
+            try {
+                // Load wallet and sign transaction
+                const keypair = await loadUserWallet(String(chatId));
+                if (!keypair) {
+                    return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
+                }
+
+                // Sign the transaction
+                const signedTxBase64 = await signAndSendTransaction(orderData.transaction, keypair);
+
+                // Execute the signed transaction
+                const execRes = await axios.post("https://api.jup.ag/trigger/v1/execute", {
+                    signedTransaction: signedTxBase64,
+                    requestId: requestId
+                }, {
+                    headers: getJupiterHeaders()
+                });
+
+                const { signature, status } = execRes.data;
+
+                // Save trigger history
+                const username = query.from.username || null;
+                await saveTriggerHistory(String(chatId), orderData.inputMint, orderData.outputMint, orderData.amount, orderData.targetPrice, orderData.orderId || requestId, username);
+
+                // Remove from pending orders
+                pendingOrders.delete(requestId);
+
+                return bot.sendMessage(chatId, `✅ *Order Executed Successfully!*\n\n🆔 Order ID: \`${orderData.orderId || requestId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
+                    parse_mode: "Markdown"
+                });
+            } catch (err) {
+                console.error("Execute order error:", err?.response?.data || err.message);
+                const errorMsg = err?.response?.data?.error || err?.response?.data?.cause || err.message;
+                return bot.sendMessage(chatId, `❌ Failed to execute order.\n\n${errorMsg}`, {
+                    parse_mode: "Markdown"
+                });
+            }
+        }
+
+        // Handle recurring order confirmation
+        if (data.startsWith('confirm_recurring_')) {
+            const orderHash = data.replace('confirm_recurring_', '');
+            let orderData = pendingRecurringOrders.get(orderHash);
+            
+            // Try global as fallback
+            if (!orderData && global.pendingRecurringOrders) {
+                orderData = global.pendingRecurringOrders.get(orderHash);
+            }
+            
+            if (!orderData) {
+                return bot.sendMessage(chatId, "❌ Order data not found. Please try again.");
+            }
+            
+            const walletRecord = await getWallet(String(chatId));
+            if (!walletRecord) {
+                return bot.sendMessage(chatId, "❌ You haven't created your wallet yet. Use /createwallet first.");
+            }
+            
+            const wallet = walletRecord.publicKey;
+            userWalletMap.set(String(chatId), wallet);
+
+            try {
+                // Convert total amount to raw amount (assuming USDC with 6 decimals)
+                const inAmount = Math.floor(orderData.totalAmount * 1e6);
+
+                const createPayload = {
+                    user: wallet,
+                    inputMint: orderData.inputMint,
+                    outputMint: orderData.outputMint,
+                    params: {
+                        time: {
+                            inAmount: inAmount.toString(),
+                            numberOfOrders: orderData.numberOfOrders,
+                            interval: orderData.intervalSeconds,
+                            minPrice: null,
+                            maxPrice: null,
+                            startAt: null
+                        }
+                    }
+                };
+
+                const createRes = await axios.post(
+                    "https://api.jup.ag/recurring/v1/createOrder",
+                    createPayload,
+                    { headers: getJupiterHeaders() }
+                );
+
+                const requestId = createRes.data?.requestId;
+                const txBase64 = createRes.data?.transaction;
+
+                if (!requestId || !txBase64) {
+                    const errorMsg = createRes.data?.error || createRes.data?.status || "Unknown error";
+                    return bot.sendMessage(chatId, `❌ Failed to create recurring order.\n\n${errorMsg}`, {
+                        parse_mode: "Markdown"
+                    });
+                }
+
+                // Store pending order for execution
+                pendingRecurringOrders.set(requestId, {
+                    chatId: String(chatId),
+                    transaction: txBase64,
+                    inputMint: orderData.inputMint,
+                    outputMint: orderData.outputMint,
+                    inAmount: orderData.totalAmount,
+                    numberOfOrders: orderData.numberOfOrders,
+                    intervalSeconds: orderData.intervalSeconds,
+                    requestId
+                });
+
+                const inputTokenInfo = await getTokenInfoV2(orderData.inputMint);
+                const outputTokenInfo = await getTokenInfoV2(orderData.outputMint);
+                const amountPerOrder = orderData.totalAmount / orderData.numberOfOrders;
+                const intervalDays = orderData.intervalSeconds / 86400;
+                
+                const orderMessage = `✅ *Recurring Order Created Successfully!*\n\n` +
+                    `📥 Input: ${orderData.totalAmount} ${inputTokenInfo?.symbol || orderData.inputMint.slice(0, 4)}\n` +
+                    `📤 Output: ${outputTokenInfo?.symbol || orderData.outputMint.slice(0, 4)}\n` +
+                    `📊 Number of Orders: ${orderData.numberOfOrders}\n` +
+                    `💰 Amount per Order: ${amountPerOrder.toFixed(2)} ${inputTokenInfo?.symbol || 'USD'}\n` +
+                    `⏰ Interval: Every ${intervalDays} day(s)\n` +
+                    `🆔 Request ID: \`${requestId}\`\n\n` +
+                    `⚠️ *Order is ready but not executed yet.*\n` +
+                    `Click the button below to execute:`;
+
+                return await bot.sendMessage(chatId, orderMessage, {
+                    parse_mode: "Markdown",
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: "🚀 Execute Order", callback_data: `execute_recurring_${requestId}` }
+                        ]]
+                    }
+                });
+
+            } catch (err) {
+                console.error("Create recurring order error:", err?.response?.data || err.message);
+                const errorMsg = err?.response?.data?.error || err?.response?.data?.status || err.message;
+                return bot.sendMessage(chatId, `❌ Failed to create recurring order.\n\n${errorMsg}`, {
+                    parse_mode: "Markdown"
+                });
+            }
+        }
+
+        // Handle recurring order cancellation (before creation)
+        if (data.startsWith('cancel_recurring_') && !data.includes('_order_')) {
+            const orderHash = data.replace('cancel_recurring_', '');
+            pendingRecurringOrders.delete(orderHash);
+            if (global.pendingRecurringOrders) {
+                global.pendingRecurringOrders.delete(orderHash);
+            }
+            return bot.sendMessage(chatId, "❌ Recurring order creation cancelled.");
+        }
+
+        // Handle recurring order execution
+        if (data.startsWith('execute_recurring_')) {
+            const requestId = data.replace('execute_recurring_', '');
+            const orderData = pendingRecurringOrders.get(requestId);
+            
+            if (!orderData) {
+                return bot.sendMessage(chatId, "❌ Order not found. It may have expired or already been executed.");
+            }
+
+            try {
+                // Load wallet and sign transaction
+                const keypair = await loadUserWallet(String(chatId));
+                if (!keypair) {
+                    return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
+                }
+
+                // Sign the transaction
+                const signedTxBase64 = await signAndSendTransaction(orderData.transaction, keypair);
+
+                // Execute the signed transaction
+                const execRes = await axios.post("https://api.jup.ag/recurring/v1/execute", {
+                    signedTransaction: signedTxBase64,
+                    requestId: requestId
+                }, {
+                    headers: getJupiterHeaders()
+                });
+
+                const { signature, status, order } = execRes.data;
+
+                // Save recurring history
+                const username = query.from.username || null;
+                await saveRecurringHistory(String(chatId), orderData.inputMint, orderData.outputMint, orderData.inAmount, orderData.numberOfOrders, orderData.intervalSeconds, order || requestId, username);
+
+                // Remove from pending orders
+                pendingRecurringOrders.delete(requestId);
+
+                return bot.sendMessage(chatId, `✅ *Recurring Order Executed Successfully!*\n\n🆔 Order ID: \`${order || requestId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
+                    parse_mode: "Markdown"
+                });
+            } catch (err) {
+                console.error("Execute recurring order error:", err?.response?.data || err.message);
+                const errorMsg = err?.response?.data?.error || err?.response?.data?.status || err.message;
+                return bot.sendMessage(chatId, `❌ Failed to execute recurring order.\n\n${errorMsg}`, {
+                    parse_mode: "Markdown"
+                });
+            }
+        }
+
+        // Handle recurring order cancellation (for active orders)
+        if (data.startsWith('cancel_recurring_order_')) {
+            const orderId = data.replace('cancel_recurring_order_', '');
+            
+            // Load wallet from database
+            const walletRecord = await getWallet(String(chatId));
+            if (!walletRecord) {
+                return bot.sendMessage(chatId, "❌ Missing wallet. Use /createwallet first.");
+            }
+            
+            const wallet = walletRecord.publicKey;
+            userWalletMap.set(String(chatId), wallet);
+
+            try {
+                const cancelPayload = {
+                    user: wallet,
+                    order: orderId
+                };
+
+                const cancelRes = await axios.post("https://api.jup.ag/recurring/v1/cancelOrder", cancelPayload, {
+                    headers: getJupiterHeaders()
+                });
+
+                const txBase64 = cancelRes.data?.transaction;
+                if (!txBase64) {
+                    return bot.sendMessage(chatId, "❌ Failed to get cancellation transaction.");
+                }
+
+                // Load wallet and sign transaction
+                const keypair = await loadUserWallet(String(chatId));
+                if (!keypair) {
+                    return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
+                }
+
+                // Sign the transaction
+                const signedTxBase64 = await signAndSendTransaction(txBase64, keypair);
+
+                // Execute the signed transaction
+                const execRes = await axios.post("https://api.jup.ag/recurring/v1/execute", {
+                    signedTransaction: signedTxBase64,
+                    requestId: orderId
+                }, {
+                    headers: getJupiterHeaders()
+                });
+
+                const { signature, status } = execRes.data;
+
+                return bot.sendMessage(chatId, `✅ *Recurring Order Cancelled!*\n\n🆔 Order ID: \`${orderId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
+                    parse_mode: "Markdown"
+                });
+            } catch (err) {
+                console.error("Cancel recurring order error:", err?.response?.data || err.message);
+                const errorMsg = err?.response?.data?.error || err?.response?.data?.status || err.message;
+                return bot.sendMessage(chatId, `❌ Failed to cancel recurring order.\n\n${errorMsg}`, {
+                    parse_mode: "Markdown"
+                });
+            }
+        }
+
+        // Handle trigger order cancellation (for active orders)
         if (data.startsWith('cancel_')) {
             const orderId = data.replace('cancel_', '');
             
@@ -823,8 +1493,8 @@ bot.on('callback_query', async (query) => {
                 headers: getJupiterHeaders()
             });
 
-            const txBase58 = cancelRes.data?.transaction;
-            if (!txBase58) {
+            const txBase64 = cancelRes.data?.transaction;
+            if (!txBase64) {
                 return bot.sendMessage(chatId, "❌ Failed to get cancellation transaction.");
             }
 
@@ -835,9 +1505,8 @@ bot.on('callback_query', async (query) => {
                     return bot.sendMessage(chatId, "❌ Failed to load wallet. Please try /createwallet again.");
                 }
 
-                // Convert base58 transaction to base64 and sign
-                const txBuffer = bs58.decode(txBase58);
-                const signedTxBase64 = await signAndSendTransaction(txBuffer.toString('base64'), keypair);
+                // Sign the transaction (it's already base64)
+                const signedTxBase64 = await signAndSendTransaction(txBase64, keypair);
 
                 // Execute the signed transaction
                 const execRes = await axios.post("https://api.jup.ag/trigger/v1/execute", {
@@ -911,6 +1580,7 @@ bot.onText(/\/history(.*)/, async (msg, match) => {
             const typeIcon = {
                 'route': '🔀',
                 'trigger': '⚡',
+                'recurring': '🔄',
                 'payment': '💸',
                 'price': '💰',
                 'notification': '🔔'
@@ -927,6 +1597,13 @@ bot.onText(/\/history(.*)/, async (msg, match) => {
                     historyText += `${typeIcon} *Trigger Order* (${date})\n`;
                     historyText += `   ${item.inputMint?.slice(0, 4)}... → ${item.outputMint?.slice(0, 4)}...\n`;
                     historyText += `   Amount: ${item.amount} | Target: $${item.targetPrice}\n`;
+                    historyText += `   Status: ${item.status} | Order: ${item.orderId?.slice(0, 8)}...\n\n`;
+                    break;
+                    
+                case 'recurring':
+                    historyText += `${typeIcon} *Recurring Order* (${date})\n`;
+                    historyText += `   ${item.inputMint?.slice(0, 4)}... → ${item.outputMint?.slice(0, 4)}...\n`;
+                    historyText += `   Total: ${item.inAmount} | Orders: ${item.numberOfOrders} | Interval: ${Math.floor(item.interval / 86400)} day(s)\n`;
                     historyText += `   Status: ${item.status} | Order: ${item.orderId?.slice(0, 8)}...\n\n`;
                     break;
                     
