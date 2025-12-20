@@ -27,6 +27,7 @@ import {
 } from './utils/database.js';
 import { createWallet, loadWallet } from './utils/wallet.js';
 import { Connection, Transaction, VersionedTransaction } from '@solana/web3.js';
+import { getJupiterHeaders, getTokenInfoV2, getTokenPrice } from './utils/jupiterApi.js';
 // const qr = require('qr-image');
 import qr from "qr-image"
 
@@ -96,9 +97,10 @@ async function toLamports({ sol = null, usd = null } = {}) {
 
     if (usd !== null) {
         try {
-            const res = await axios.get('https://lite-api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112');
-            console.log(res.data)
-            const solPrice = res.data.data["So11111111111111111111111111111111111111112"].price;
+            const solPrice = await getTokenPrice('SOL');
+            if (!solPrice) {
+                throw new Error("Failed to fetch SOL price");
+            }
             return Math.round((usd / solPrice) * LAMPORTS_PER_SOL);
         } catch (e) {
             console.error("Error fetching SOL price:", e.message);
@@ -318,13 +320,15 @@ bot.onText(/\/payto (\w{32,44}) (\d+)/, async (msg, match) => {
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
-    const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${USDC_MINT}&amount=${amount}&slippageBps=50&swapMode=ExactOut`;
-    const quote = await (await fetch(quoteUrl)).json();
+    const quoteUrl = `https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${USDC_MINT}&amount=${amount}&slippageBps=50&swapMode=ExactOut`;
+    const quote = await (await fetch(quoteUrl, {
+        headers: getJupiterHeaders()
+    })).json();
 
-    const swapRes = await (await fetch(`https://lite-api.jup.ag/swap/v1/swap`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+   const swapRes = await (await fetch(`https://api.jup.ag/swap/v1/swap`, {
+  method: "POST",
+  headers: getJupiterHeaders(),
+  body: JSON.stringify({
         quoteResponse: quote,
         userPublicKey: payerWallet,
         destinationTokenAccount: merchantUSDCATA.toBase58()
@@ -344,10 +348,12 @@ bot.onText(/\/payto (\w{32,44}) (\d+)/, async (msg, match) => {
     const signedTxBase64 = await signAndSendTransaction(swapRes.swapTransaction, keypair);
 
     // Execute the signed transaction
-    const execRes = await axios.post("https://lite-api.jup.ag/ultra/v1/execute", {
-      signedTransaction: signedTxBase64,
-      requestId: swapRes.requestId
-    });
+        const execRes = await axios.post("https://api.jup.ag/ultra/v1/execute", {
+            signedTransaction: signedTxBase64,
+            requestId: swapRes.requestId
+        }, {
+            headers: getJupiterHeaders()
+        });
 
     const { signature, status } = execRes.data;
 
@@ -378,7 +384,9 @@ bot.onText(/\/about/, async (msg) => {
     userWalletMap.set(chatId, wallet); // Update in-memory map
 
     try {
-        const response = await axios.get(`https://lite-api.jup.ag/ultra/v1/balances/${wallet}`);
+        const response = await axios.get(`https://api.jup.ag/ultra/v1/balances/${wallet}`, {
+            headers: getJupiterHeaders()
+        });
         const data = response.data;
 
         if (data.error) {
@@ -399,27 +407,20 @@ bot.onText(/\/price (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const username = msg.from.username || null;
     const mintAddress = match[1].trim();
-    const resolvedMint = resolveTokenMint(mintAddress);
     
     try {
-        const tokenRes = await fetch(`https://lite-api.jup.ag/tokens/v1/token/${resolvedMint}`);
-        const tokenInfo = await tokenRes.json();
-        const priceRes = await fetch(`https://lite-api.jup.ag/price/v2?ids=${resolvedMint}`);
-        const priceJson = await priceRes.json();
+        const tokenInfo = await getTokenInfoV2(mintAddress);
 
-        const priceData = priceJson.data[resolvedMint];
-        const price = parseFloat(priceData?.price ?? "0");
-
-        if (!price) {
-            return bot.sendMessage(chatId, "❌ Could not retrieve a valid price.");
+        if (!tokenInfo || !tokenInfo.price) {
+            return bot.sendMessage(chatId, "❌ Could not retrieve a valid price. Please check the token name or address.");
         }
 
-        const msgText = `💰 *${tokenInfo.name}* (${tokenInfo.symbol})\n\n📈 Price: $${price.toFixed(6)}`;
+        const msgText = `💰 *${tokenInfo.name}* (${tokenInfo.symbol})\n\n📈 Price: $${tokenInfo.price.toFixed(6)}${tokenInfo.mcap ? `\n💵 Market Cap: $${(tokenInfo.mcap / 1e9).toFixed(2)}B` : ''}${tokenInfo.isVerified ? '\n✅ Verified' : ''}`;
 
         // Save price check history
-        await savePriceCheckHistory(chatId, mintAddress, price, username);
+        await savePriceCheckHistory(chatId, mintAddress, tokenInfo.price, username);
 
-        await bot.sendPhoto(chatId, tokenInfo.logoURI, {
+        await bot.sendPhoto(chatId, tokenInfo.icon, {
             caption: msgText,
             parse_mode: "Markdown"
         });
@@ -433,15 +434,28 @@ bot.onText(/\/price (.+)/, async (msg, match) => {
 bot.onText(/\/tokens/, async (msg) => {
     const chatId = msg.chat.id;
     try {
-        const response = await axios.get('https://lite-api.jup.ag/tokens/v1/mints/tradable');
-        const tokenMints = response.data.slice(0, 5);
+        // Use V2 API to get top trending tokens
+        const response = await fetch('https://api.jup.ag/tokens/v2/toptrending/24h?limit=5', {
+            headers: getJupiterHeaders()
+        });
+        
+        if (!response.ok) {
+            throw new Error(`API error: ${response.status}`);
+        }
+        
+        const tokens = await response.json();
 
-        const inlineKeyboard = tokenMints.map((mint) => [{
-            text: mint.slice(0, 6) + '...',
-            callback_data: `token_${mint}`
+        if (!tokens || tokens.length === 0) {
+            return bot.sendMessage(chatId, '❌ No tokens found.');
+        }
+
+        const inlineKeyboard = tokens.map((token) => [{
+            text: `${token.symbol} - $${token.price?.toFixed(4) || 'N/A'}`,
+            callback_data: `token_${token.id}`
         }]);
 
-        bot.sendMessage(chatId, 'Select a token to view details:', {
+        bot.sendMessage(chatId, '📊 *Top Trending Tokens (24h)*\n\nSelect a token to view details:', {
+            parse_mode: 'Markdown',
             reply_markup: {
                 inline_keyboard: inlineKeyboard
             }
@@ -468,21 +482,27 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
     const args = match[1].trim().split(" ");
 
     if (args[0] === 'orders') {
-        const res = await axios.get(`https://lite-api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=active`);
+        const res = await axios.get(`https://api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=active`, {
+            headers: getJupiterHeaders()
+        });
         if (!res.data.length) return bot.sendMessage(chatId, "📭 No active orders.");
         const orders = res.data.map(o => `• 🆔 ${o.order} (${o.params.makingAmount} → ${o.params.takingAmount})`);
         return bot.sendMessage(chatId, `📋 *Active Orders*\n\n${orders.join('\n')}`, { parse_mode: "Markdown" });
     }
 
     if (args[0] === 'orderhistory') {
-        const res = await axios.get(`https://lite-api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=history`);
+        const res = await axios.get(`https://api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=history`, {
+            headers: getJupiterHeaders()
+        });
         if (!res.data.length) return bot.sendMessage(chatId, "📭 No order history found.");
         const orders = res.data.map(o => `• 🆔 ${o.order} (${o.params.makingAmount} → ${o.params.takingAmount})`);
         return bot.sendMessage(chatId, `📜 *Order History*\n\n${orders.join('\n')}`, { parse_mode: "Markdown" });
     }
 
     if (args[0] === 'cancelorder') {
-        const res = await axios.get(`https://lite-api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=active`);
+        const res = await axios.get(`https://api.jup.ag/trigger/v1/getTriggerOrders?user=${wallet}&orderStatus=active`, {
+            headers: getJupiterHeaders()
+        });
         const orders = res.data;
         if (!orders.length) return bot.sendMessage(chatId, "📭 No active orders to cancel.");
 
@@ -530,7 +550,7 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
         const createRes = await axios.post(
             "https://api.jup.ag/trigger/v1/createOrder",
             createPayload,
-            { headers: { 'Content-Type': 'application/json' } }
+            { headers: getJupiterHeaders() }
         );
 
         const orderId = createRes.data?.requestId;
@@ -551,11 +571,11 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
         const signedTxBase64 = await signAndSendTransaction(txBuffer.toString('base64'), keypair);
 
         // Execute the signed transaction
-        const execRes = await axios.post("https://lite-api.jup.ag/trigger/v1/execute", {
+        const execRes = await axios.post("https://api.jup.ag/trigger/v1/execute", {
             signedTransaction: signedTxBase64,
             requestId: orderId
         }, {
-            headers: { 'Content-Type': 'application/json' }
+            headers: getJupiterHeaders()
         });
 
         const { signature, status } = execRes.data;
@@ -594,9 +614,11 @@ bot.onText(/\/route (.+)/, async (msg, match) => {
     const [inputMint, outputMint, amount] = input;
 
     const fetchOrder = async (includeWallet = true) => {
-        const base = `https://lite-api.jup.ag/ultra/v1/order?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}`;
+        const base = `https://api.jup.ag/ultra/v1/order?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}`;
         const url = includeWallet ? `${base}&taker=${wallet}` : base;
-        const res = await fetch(url);
+        const res = await fetch(url, {
+            headers: getJupiterHeaders()
+        });
         return res.json();
     };
 
@@ -662,9 +684,11 @@ ${retried ? "⚠️ *Insufficient balance. Preview only.*" : ""}
         const signedTxBase64 = await signAndSendTransaction(transaction, keypair);
 
         // Execute the signed transaction
-        const execRes = await axios.post("https://lite-api.jup.ag/ultra/v1/execute", {
+        const execRes = await axios.post("https://api.jup.ag/ultra/v1/execute", {
             signedTransaction: signedTxBase64,
             requestId: requestId
+        }, {
+            headers: getJupiterHeaders()
         });
 
         const { signature, status } = execRes.data;
@@ -701,19 +725,16 @@ bot.onText(/\/notify (.+)/, async (msg, match) => {
     }
 
     try {
-        const tokenRes = await fetch(`https://lite-api.jup.ag/tokens/v1/token/${resolvedMint}`);
-        const tokenInfo = await tokenRes.json();
-
-        const priceRes = await fetch(`https://lite-api.jup.ag/price/v2?ids=${resolvedMint}`);
-        const priceJson = await priceRes.json();
-        const currentPrice = parseFloat(priceJson.data[resolvedMint]?.price ?? "0");
-
-        if (!currentPrice) {
+        const tokenInfo = await getTokenInfoV2(tokenName);
+        
+        if (!tokenInfo || !tokenInfo.price) {
             return bot.sendMessage(chatId, "❌ Couldn't fetch valid token price.");
         }
 
+        const currentPrice = tokenInfo.price;
+
         // Save notification history
-        await saveNotificationHistory(chatId, resolvedMint, condition, targetPrice, username);
+        await saveNotificationHistory(chatId, tokenInfo.id, condition, targetPrice, username);
 
         await bot.sendMessage(chatId,
             `📊 *${tokenInfo.name}* (${tokenInfo.symbol})\n` +
@@ -726,9 +747,12 @@ bot.onText(/\/notify (.+)/, async (msg, match) => {
 
         const intervalId = setInterval(async () => {
             try {
-                const res = await fetch(`https://lite-api.jup.ag/price/v2?ids=${resolvedMint}`);
-                const json = await res.json();
-                const priceNow = parseFloat(json.data[resolvedMint]?.price ?? "0");
+                const priceNow = await getTokenPrice(tokenInfo.id);
+                
+                if (!priceNow) {
+                    console.error(`Failed to fetch price for ${tokenInfo.symbol}`);
+                    return;
+                }
 
                 console.log(`Current price for ${tokenInfo.symbol}: $${priceNow}`);
 
@@ -763,17 +787,15 @@ bot.on('callback_query', async (query) => {
         if (data.startsWith('token_')) {
             const mint = data.replace('token_', '');
 
-            const [tokenResponse, priceResponse] = await Promise.all([
-                axios.get(`https://lite-api.jup.ag/tokens/v1/token/${mint}`),
-                axios.get(`https://lite-api.jup.ag/price/v2?ids=${mint}`)
-            ]);
+            const tokenInfo = await getTokenInfoV2(mint);
 
-            const token = tokenResponse.data;
-            const price = priceResponse.data[mint]?.price ?? 0;
+            if (!tokenInfo) {
+                return bot.sendMessage(chatId, "❌ Failed to fetch token information.");
+            }
 
-            const caption = `💠 *${token.name} (${token.symbol})*\n\n💵 *Price*: $${price.toFixed(4)}\n📦 Volume (24h): $${Math.floor(token.daily_volume).toLocaleString()}`;
+            const caption = `💠 *${tokenInfo.name} (${tokenInfo.symbol})*\n\n💵 *Price*: $${tokenInfo.price.toFixed(4)}\n📦 Volume (24h): $${Math.floor(tokenInfo.daily_volume).toLocaleString()}${tokenInfo.mcap ? `\n💵 Market Cap: $${(tokenInfo.mcap / 1e9).toFixed(2)}B` : ''}${tokenInfo.isVerified ? '\n✅ Verified' : ''}`;
 
-            return bot.sendPhoto(chatId, token.logoURI, {
+            return bot.sendPhoto(chatId, tokenInfo.icon, {
                 caption,
                 parse_mode: 'Markdown'
             });
@@ -797,8 +819,8 @@ bot.on('callback_query', async (query) => {
                 computeUnitPrice: "auto"
             };
 
-            const cancelRes = await axios.post("https://lite-api.jup.ag/trigger/v1/cancelOrder", cancelPayload, {
-                headers: { 'Content-Type': 'application/json' }
+            const cancelRes = await axios.post("https://api.jup.ag/trigger/v1/cancelOrder", cancelPayload, {
+                headers: getJupiterHeaders()
             });
 
             const txBase58 = cancelRes.data?.transaction;
@@ -818,11 +840,11 @@ bot.on('callback_query', async (query) => {
                 const signedTxBase64 = await signAndSendTransaction(txBuffer.toString('base64'), keypair);
 
                 // Execute the signed transaction
-                const execRes = await axios.post("https://lite-api.jup.ag/trigger/v1/execute", {
+                const execRes = await axios.post("https://api.jup.ag/trigger/v1/execute", {
                     signedTransaction: signedTxBase64,
                     requestId: orderId
                 }, {
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: getJupiterHeaders()
                 });
 
                 const { signature, status } = execRes.data;

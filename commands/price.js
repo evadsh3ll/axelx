@@ -1,38 +1,27 @@
 // commands/price.js
-import { resolveTokenMint } from '../utils/tokens.js';
+// Legacy wrapper for backward compatibility
+import { getTokenInfoV2 } from '../utils/jupiterApi.js';
 
 export async function getTokenPrice(mintAddress) {
     try {
-        const resolvedMint = resolveTokenMint(mintAddress);
-        if (!resolvedMint) {
+        const tokenInfo = await getTokenInfoV2(mintAddress);
+        
+        if (!tokenInfo || !tokenInfo.price) {
             return {
                 success: false,
-                error: "❌ Invalid token. Please check the token name or address."
-            };
-        }
-
-        const [tokenRes, priceRes] = await Promise.all([
-            fetch(`https://lite-api.jup.ag/tokens/v1/token/${resolvedMint}`),
-            fetch(`https://lite-api.jup.ag/price/v2?ids=${resolvedMint}`)
-        ]);
-
-        const tokenInfo = await tokenRes.json();
-        const priceJson = await priceRes.json();
-
-        const priceData = priceJson.data[resolvedMint];
-        const price = parseFloat(priceData?.price ?? "0");
-
-        if (!price) {
-            return {
-                success: false,
-                error: "❌ Could not retrieve a valid price."
+                error: "❌ Invalid token or could not retrieve price. Please check the token name or address."
             };
         }
 
         return {
             success: true,
-            token: tokenInfo,
-            price: price
+            token: {
+                name: tokenInfo.name,
+                symbol: tokenInfo.symbol,
+                logoURI: tokenInfo.icon,
+                daily_volume: tokenInfo.daily_volume
+            },
+            price: tokenInfo.price
         };
     } catch (err) {
         console.error("Error fetching price/token info:", err.message);
