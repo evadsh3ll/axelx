@@ -17,7 +17,7 @@ import {
     saveWallet, 
     getWallet,
     saveRouteHistory, 
-    saveTriggerHistory,
+    saveTriggerHistory, 
     saveRecurringHistory,
     savePaymentHistory, 
     savePriceCheckHistory, 
@@ -129,7 +129,7 @@ bot.onText(/\/help/, (msg) => {
 /about - Check your balance
 /price <token> - Get token price
 /tokens - List available tokens
-/route <input> <output> <amount> - Get swap route
+/route <input> <output> <amount> - Get swap route via Ultra Swap API (supports gasless)
 /trigger <input> <output> <amount> <price> - Create trigger order
 /trigger orders - Show active orders with cancel buttons
 /trigger orderhistory - Show order history
@@ -171,11 +171,20 @@ bot.onText(/\/help/, (msg) => {
 ✅ Sufficient balance in your wallet
 ✅ Valid token pairs (e.g., USDC/SOL, USDC/JUP)
 
+*Ultra Swap API:*
+The /route command uses Jupiter Ultra Swap API which provides:
+• Gasless transactions (when applicable, 5-10 bps fee)
+• Best execution via Metis Routing Engine
+• Automatic transaction handling (slippage, priority fees, landing)
+• Status polling (up to 2 minutes)
+• Support for any token pair on Solana
+• Dynamic rate limits (scales with swap volume)
+
 *Natural Language Commands (Auto-Execute):*
 • "create wallet" → Executes /createwallet
 • "what's my balance?" → Executes /about
 • "get price of SOL" → Executes /price SOL
-• "get route for 1 SOL to USDC" → Executes /route SOL USDC 1
+• "get route for 1 SOL to USDC" or "ultra swap 1 SOL to USDC" → Executes /route SOL USDC 1 (via Ultra API)
 • "trigger 1 SOL to USDC at $50" → Shows confirmation button
 • "show my orders" → Shows active trigger orders
 • "recurring order 1000 USDC to SOL 10 orders every day" → Shows confirmation button
@@ -188,7 +197,8 @@ bot.onText(/\/help/, (msg) => {
 *Examples (All Auto-Execute):*
 • "I want to create a wallet"
 • "Show me the price of Bitcoin"
-• "Get me a route for 2 SOL to USDC"
+• "Get me a route for 2 SOL to USDC" → Executes via Ultra Swap API
+• "Ultra swap 1 SOL to USDC" → Executes via Ultra Swap API
 • "Create a trigger order for 1 SOL to USDC at $45"
 • "Show my trigger orders"
 • "Create recurring order 1000 USDC to SOL 10 orders every day"
@@ -372,9 +382,9 @@ bot.onText(/\/payto (\w{32,44}) (\d+)/, async (msg, match) => {
     })).json();
 
    const swapRes = await (await fetch(`https://api.jup.ag/swap/v1/swap`, {
-  method: "POST",
+      method: "POST",
   headers: getJupiterHeaders(),
-  body: JSON.stringify({
+      body: JSON.stringify({
         quoteResponse: quote,
         userPublicKey: payerWallet,
         destinationTokenAccount: merchantUSDCATA.toBase58()
@@ -609,8 +619,8 @@ bot.onText(/\/trigger (.+)/, async (msg, match) => {
     // Store pending order details temporarily
     pendingOrders.set(orderHash, {
         chatId,
-        inputMint,
-        outputMint,
+            inputMint,
+            outputMint,
         amount,
         targetPrice,
         username
@@ -928,9 +938,9 @@ bot.onText(/\/notify (.+)/, async (msg, match) => {
             (condition === "below" && currentPrice <= targetPrice);
 
         if (shouldNotifyNow) {
-            await bot.sendMessage(chatId,
-                `📊 *${tokenInfo.name}* (${tokenInfo.symbol})\n` +
-                `💵 Current Price: $${currentPrice.toFixed(6)}\n\n` +
+        await bot.sendMessage(chatId,
+            `📊 *${tokenInfo.name}* (${tokenInfo.symbol})\n` +
+            `💵 Current Price: $${currentPrice.toFixed(6)}\n\n` +
                 `🎯 *Price target already reached!*\n` +
                 `Target: *${condition}* $${targetPrice}\n\n` +
                 `💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`,
@@ -967,8 +977,8 @@ bot.onText(/\/notify (.+)/, async (msg, match) => {
                 if (shouldNotify) {
                     try {
                         await bot.sendMessage(chatId, `🎯 *${tokenInfo.symbol}* is now at $${priceNow.toFixed(4)}!\n\n💬 Do you want to *buy it*, *trigger it*, or just *get notified*?`, {
-                            parse_mode: "Markdown"
-                        });
+                        parse_mode: "Markdown"
+                    });
                     } catch (sendErr) {
                         console.error(`Failed to send notification message: ${sendErr.message}`);
                     }
@@ -1042,14 +1052,14 @@ bot.on('callback_query', async (query) => {
                             const createPayload = {
                                 inputMint: globalData.inputMint,
                                 outputMint: globalData.outputMint,
-                                maker: wallet,
+                maker: wallet,
                                 payer: wallet,
                                 params: {
                                     makingAmount,
                                     takingAmount
                                 },
-                                computeUnitPrice: "auto"
-                            };
+                computeUnitPrice: "auto"
+            };
 
                             const createRes = await axios.post(
                                 "https://api.jup.ag/trigger/v1/createOrder",
@@ -1190,8 +1200,8 @@ bot.on('callback_query', async (query) => {
                 console.error("Create order error:", err?.response?.data || err.message);
                 const errorMsg = err?.response?.data?.error || err?.response?.data?.cause || err.message;
                 return bot.sendMessage(chatId, `❌ Failed to create trigger order.\n\n${errorMsg}`, {
-                    parse_mode: "Markdown"
-                });
+                parse_mode: "Markdown"
+            });
             }
         }
 
@@ -1450,18 +1460,18 @@ bot.on('callback_query', async (query) => {
 
                 // Execute the signed transaction
                 const execRes = await axios.post("https://api.jup.ag/recurring/v1/execute", {
-                    signedTransaction: signedTxBase64,
+            signedTransaction: signedTxBase64,
                     requestId: orderId
-                }, {
+        }, {
                     headers: getJupiterHeaders()
-                });
+        });
 
-                const { signature, status } = execRes.data;
+        const { signature, status } = execRes.data;
 
                 return bot.sendMessage(chatId, `✅ *Recurring Order Cancelled!*\n\n🆔 Order ID: \`${orderId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
-                    parse_mode: "Markdown"
-                });
-            } catch (err) {
+            parse_mode: "Markdown"
+        });
+    } catch (err) {
                 console.error("Cancel recurring order error:", err?.response?.data || err.message);
                 const errorMsg = err?.response?.data?.error || err?.response?.data?.status || err.message;
                 return bot.sendMessage(chatId, `❌ Failed to cancel recurring order.\n\n${errorMsg}`, {
@@ -1510,17 +1520,17 @@ bot.on('callback_query', async (query) => {
 
                 // Execute the signed transaction
                 const execRes = await axios.post("https://api.jup.ag/trigger/v1/execute", {
-                    signedTransaction: signedTxBase64,
+            signedTransaction: signedTxBase64,
                     requestId: orderId
                 }, {
                     headers: getJupiterHeaders()
-                });
+        });
 
-                const { signature, status } = execRes.data;
+        const { signature, status } = execRes.data;
 
                 return bot.sendMessage(chatId, `✅ *Order Cancelled!*\n\n🆔 Order ID: \`${orderId}\`\n🔗 [View on Solscan](https://solscan.io/tx/${signature})\n📦 Status: *${status}*`, {
-                    parse_mode: "Markdown"
-                });
+            parse_mode: "Markdown"
+        });
             } catch (err) {
                 console.error("Cancel order error:", err);
                 return bot.sendMessage(chatId, `❌ Failed to cancel order: ${err.message}`);

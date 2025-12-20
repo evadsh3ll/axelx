@@ -12,7 +12,7 @@ A Telegram bot for Solana DeFi operations with in-app wallet management and natu
 ### Trading & DeFi Commands
 - `/price <token>` - Get token price
 - `/tokens` - List available tokens
-- `/route <input> <output> <amount>` - Get swap route and execute
+- `/route <input> <output> <amount>` - Get swap route via Ultra Swap API and execute (supports gasless transactions)
 - `/trigger <input> <output> <amount> <price>` - Create trigger order (with confirmation and execute buttons)
 - `/trigger orders` - Show active orders with cancel buttons
 - `/trigger orderhistory` - Show order history
@@ -31,7 +31,7 @@ The bot supports natural language processing and **automatically executes comman
 - "export my wallet" → **Executes** `/exportwallet`
 - "what's my balance?" → **Executes** `/about`
 - "get price of SOL" → **Executes** `/price SOL`
-- "get route for 1 SOL to USDC" → **Executes** `/route SOL USDC 1`
+- "get route for 1 SOL to USDC" or "ultra swap 1 SOL to USDC" → **Executes** `/route SOL USDC 1` (via Ultra Swap API)
 - "trigger 1 SOL to USDC at $50" → Shows confirmation button, then creates order, then shows execute button
 - "show my orders" or "show orders" → Shows active trigger orders with cancel buttons
 - "recurring order 1000 USDC to SOL 10 orders every day" → Shows confirmation button for recurring order
@@ -193,11 +193,54 @@ Bot: ✅ Your AXELX Wallet is ready
 ## API Integration
 
 The bot integrates with:
-- **Jupiter Aggregator API** - For swaps and routing
+- **Jupiter Ultra Swap API** - For swaps with gasless support, best execution, and transaction handling
 - **Jupiter Trigger API** - For limit orders
 - **Jupiter Recurring API** - For recurring orders (DCA)
-- **Jupiter Ultra API** - For gasless transactions
+- **Jupiter Tokens API V2** - For token search and information
+- **Jupiter Price API V2** - For token price data
 - **Solana Web3.js** - For transaction signing and wallet management
+
+### Jupiter Ultra Swap API
+
+The `/route` command uses **Jupiter Ultra Swap API** which provides:
+
+- **Gasless Transactions**: Automatic gasless support when applicable (5-10 bps fee)
+- **Best Execution**: Routes through Metis Routing Engine for optimal prices across all DEXes
+- **Transaction Handling**: Automatic handling of slippage, priority fees, and transaction landing
+- **Status Polling**: Built-in transaction status polling (up to 2 minutes)
+- **Multiple Swap Types**: Supports both aggregator (Iris) and RFQ (JupiterZ) swap types
+- **Error Handling**: Comprehensive error codes for better user experience
+
+**Ultra Swap Features:**
+- ✅ Gasless support (when applicable)
+- ✅ Automatic priority fee calculation
+- ✅ Transaction retry and status polling
+- ✅ Best price routing across all DEXes
+- ✅ Support for any token pair on Solana
+- ✅ Dynamic rate limits based on swap volume
+
+**How it works:**
+1. User requests a route (e.g., `/route SOL USDC 1` or "get route for 1 SOL to USDC")
+2. Bot fetches quote and swap transaction from Ultra API
+3. Transaction is signed with user's wallet
+4. Transaction is executed via Ultra API `/execute` endpoint
+5. Bot polls for transaction status and reports success/failure
+
+**Ultra API Endpoints Used:**
+- `GET /ultra/v1/order` - Get quote and swap transaction
+- `POST /ultra/v1/execute` - Execute signed transaction with status polling
+- `GET /ultra/v1/search` - Search tokens by symbol, name, or mint address (via Tokens API V2)
+- `GET /ultra/v1/holdings/{address}` - Get detailed token holdings (future feature)
+
+**Ultra Swap Response Codes:**
+- Success: `status: "Success"` with transaction signature
+- Error Codes: Comprehensive error handling for insufficient funds, expired transactions, slippage exceeded, etc.
+- Transaction Status: Automatic polling for up to 2 minutes
+
+**Fees:**
+- Without custom fees: Jupiter takes 5-10 bps of swap amount
+- Gasless transactions: No signature fees when applicable
+- Dynamic rate limits: Scale with swap volume (no payment needed)
 
 ## Database
 
